@@ -2,21 +2,24 @@
 (() => {
   'use strict';
   const send = globalThis.postMessage.bind(globalThis);
-  let pyodide, execute, inspect, responses, packageCatalog = [], busy = false, runId = 0, maxOutput = 100000;
+  let pyodide, execute, inspect, responses, packageCatalog = [], limits, busy = false, runId = 0;
   let stdout = '', stderr = '', truncated = false, lastStream = 0;
   const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
-  const cleanError = error => error instanceof Error ? error.message : 'An unexpected Python runtime error occurred.';
+  const cleanError = error => error instanceof Error ? error.message.slice(0, limits?.fatalErrorChars ?? 1000) : 'An unexpected Python runtime error occurred.';
   const cleanPackageError = error => {
-    const message = cleanError(error);
-    const pythonError = [...message.matchAll(/(?:ModuleNotFoundError|ImportError|RuntimeError|ValueError|OSError):[^\r\n]*/g)].at(-1)?.[0];
-    return (pythonError || message.split(/\r?\n/).find(line => line.trim()) || 'The package could not be loaded.').slice(0, 500);
+    const message = error instanceof Error ? error.message.slice(0, limits.errorChars) : cleanError(error);
+    let pythonError;
+    for (const match of message.matchAll(/(?:ModuleNotFoundError|ImportError|RuntimeError|ValueError|OSError):[^\r\n]*/g))
+      pythonError = match[0];
+    return (pythonError || message.split(/\r?\n/).find(line => line.trim()) || 'The package could not be loaded.').slice(0, limits.packageErrorChars);
   };
 
   function capture(channel, bytes) {
-    const value = decoders[channel].decode(bytes, { stream: true });
     const used = stdout.length + stderr.length;
-    const available = Math.max(0, maxOutput - used);
-    if (value.length > available) truncated = true;
+    const available = Math.max(0, limits.outputChars - used);
+    const prefix = bytes.subarray(0, Math.min(bytes.length, available * 4 + 4));
+    const value = available ? decoders[channel].decode(prefix, { stream: true }) : '';
+    if (bytes.length > prefix.length || value.length > available || (!available && bytes.length)) truncated = true;
     if (channel === 'stdout') stdout += value.slice(0, available);
     else stderr += value.slice(0, available);
     if (runId && performance.now() - lastStream > 80) {
@@ -28,7 +31,9 @@
 
   async function initialize(data) {
     const { files, executor } = data.assets;
-    maxOutput = data.maxOutput;
+    if (!data.limits || !Number.isSafeInteger(data.limits.sourceChars) || !Number.isSafeInteger(data.limits.outputChars))
+      throw new Error('The runtime limits are invalid.');
+    limits = data.limits;
     packageCatalog = Array.isArray(data.packageCatalog) ? data.packageCatalog : [];
     // Pyodide's loader sees fixed in-memory assets, never the actual fetch API.
     // CSP independently prevents network requests, including through alternate APIs.
@@ -64,14 +69,17 @@
   }
 
   async function loadPackages(data) {
-    const results = Array.isArray(data.errors) ? data.errors.slice() : [];
+    const results = data.errors.map(item => ({
+      id: typeof item?.id === 'string' ? item.id.slice(0, 64) : '',
+      error: typeof item?.error === 'string' ? item.error.slice(0, limits.packageErrorChars) : 'The package could not be loaded.',
+    }));
     for (const [name, bytes] of Object.entries(data.files || {})) {
       if (/^[A-Za-z0-9][A-Za-z0-9_.+-]*$/.test(name) && !name.includes('..') && bytes instanceof ArrayBuffer)
         responses.set('https://runtime.invalid/' + name, bytes);
     }
-    for (const item of Array.isArray(data.packages) ? data.packages : []) {
-      const trusted = packageCatalog.find(entry => entry.id === item.id && entry.runtimeName === item.runtimeName && entry.importName === item.importName);
-      if (!trusted) { results.push({ id: typeof item.id === 'string' ? item.id : '', error: 'The package request was rejected.' }); continue; }
+    for (const item of data.packages) {
+      const trusted = item && packageCatalog.find(entry => entry.id === item.id && entry.runtimeName === item.runtimeName && entry.importName === item.importName);
+      if (!trusted) { results.push({ id: typeof item?.id === 'string' ? item.id.slice(0, 64) : '', error: 'The package request was rejected.' }); continue; }
       try {
         await pyodide.loadPackage(trusted.runtimeName);
         const imported = pyodide.runPython(`__import__(${JSON.stringify(trusted.importName)}) is not None`);
@@ -79,7 +87,7 @@
         results.push({ id: trusted.id, loaded: true });
       } catch (error) { results.push({ id: trusted.id, error: cleanPackageError(error) }); }
     }
-    const loadedRuntimeNames = Object.keys(pyodide.loadedPackages || {});
+    const loadedRuntimeNames = Object.keys(pyodide.loadedPackages || {}).slice(0, limits.runtimePackageCount);
     const loadedPackageIds = [];
     for (const item of packageCatalog) {
       if (!loadedRuntimeNames.includes(item.runtimeName)) continue;
@@ -92,13 +100,17 @@
   }
 
   globalThis.onmessage = async ({ data }) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
     if (data.type === 'init') {
+      if (pyodide) { send({ type: 'fatal', message: 'The Python runtime received a duplicate initialization.' }); return; }
       try { await initialize(data); }
       catch (error) { send({ type: 'fatal', message: `Python could not start. ${cleanError(error)}` }); }
       return;
     }
     if (data.type === 'load-packages') {
-      if (busy || !pyodide || !Number.isInteger(data.id)) return;
+      if (busy || !pyodide || !Number.isSafeInteger(data.id) || data.id < 1 ||
+          !Array.isArray(data.packages) || data.packages.length > limits.packageCount ||
+          !Array.isArray(data.errors) || data.errors.length > limits.packageCount) return;
       busy = true;
       try { await loadPackages(data); }
       catch (error) { send({ type: 'package-result', id: data.id, results: [], loadedRuntimeNames: [], error: cleanError(error) }); }
@@ -107,9 +119,9 @@
     }
     const analysisOperations = ['compile', 'inspect', 'diagnose'];
     if (!['run', 'analysis'].includes(data.type) || busy || !execute || !Number.isSafeInteger(data.id) ||
-        typeof data.source !== 'string' || data.source.length > 100000 ||
+        typeof data.source !== 'string' || data.source.length > limits.sourceChars || !data.source.trim() || data.id < 1 ||
         (data.type === 'analysis' && !analysisOperations.includes(data.operation)) || typeof data.filename !== 'string' ||
-        !data.filename || data.filename.length > 240 || /[\x00-\x1f\x7f]/.test(data.filename)) return;
+        !data.filename || data.filename.length > limits.filenameChars || /[\x00-\x1f\x7f]/.test(data.filename)) return;
     busy = true;
     runId = data.id;
     stdout = ''; stderr = ''; truncated = false; lastStream = 0;
@@ -118,14 +130,18 @@
     try {
       let result;
       if (data.type === 'run') {
-        result = JSON.parse(execute(data.source, data.filename));
+        const serialized = execute(data.source, data.filename, limits.errorChars);
+        if (serialized.length > limits.resultChars) throw new Error('The Python result exceeded its size limit.');
+        result = JSON.parse(serialized);
       } else {
         if (!inspect) {
           if (typeof data.inspector !== 'string') throw new Error('The inspection source is unavailable.');
           pyodide.runPython(data.inspector);
           inspect = pyodide.globals.get('_pylab_inspect');
         }
-        result = JSON.parse(inspect(data.source, data.filename));
+        const serialized = inspect(data.source, data.filename, JSON.stringify(limits));
+        if (serialized.length > limits.resultChars) throw new Error('The Python analysis exceeded its size limit.');
+        result = JSON.parse(serialized);
       }
       send({ type: 'result', id: runId, operation: data.type === 'run' ? 'run' : data.operation,
         ...result, stdout, stderr, truncated, duration: performance.now() - started });

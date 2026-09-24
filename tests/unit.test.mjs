@@ -6,6 +6,8 @@ import { createEngineResult, processWorkerResult, validateOutput } from '../pyth
 import { WorkerClient } from '../python-engine/worker-client.js';
 import { PYTHON_PACKAGES } from '../runtime/packages.js';
 import { resolvePackageArchives } from '../runtime/assets.js';
+import { LIMITS } from '../runtime/config.js';
+import { normalizeRequest } from '../python-engine/request.js';
 
 function fixture(t, options = {}) {
   const transports = [], calls = [], statuses = [], results = [];
@@ -33,7 +35,8 @@ async function initialized(t, options) {
   return f;
 }
 function resultMessage(engine, fields = {}) {
-  return { type: 'result', id: engine.getState().requestId, ...fields };
+  return { type: 'result', id: engine.getState().requestId, operation: engine.getState().activeOperation,
+    stdout: '', stderr: '', truncated: false, error: '', duration: 0, ...fields };
 }
 
 test('curated metadata preserves all nine package and import identifiers', () => {
@@ -108,6 +111,75 @@ test('invalid source, filename and timeout are rejected without dispatch', async
   assert.throws(() => createPythonEngine({ onResult: true }), { code: 'INVALID_OPTIONS' });
 });
 
+test('source and synthetic filename enforce both sides of their exact boundaries', async t => {
+  const { engine, calls } = await initialized(t);
+  for (const size of [LIMITS.sourceChars - 1, LIMITS.sourceChars])
+    assert.equal(normalizeRequest('x'.repeat(size)).source.length, size);
+  for (const size of [LIMITS.sourceChars + 1, LIMITS.sourceChars * 10])
+    await assert.rejects(engine.run('x'.repeat(size)), { code: 'SOURCE_TOO_LARGE' });
+  for (const size of [LIMITS.filenameChars - 1, LIMITS.filenameChars])
+    assert.equal(normalizeRequest({ source: 'pass', filename: 'x'.repeat(size) }).filename.length, size);
+  for (const size of [LIMITS.filenameChars + 1, LIMITS.filenameChars * 10])
+    await assert.rejects(engine.run({ source: 'pass', filename: 'x'.repeat(size) }), { code: 'INVALID_FILENAME' });
+  await assert.rejects(engine.run({ get source() { throw new Error('private source'); } }),
+    { code: 'INVALID_REQUEST', message: 'The Python request could not be read.' });
+  assert.equal(normalizeRequest({ source: 'pass', filename: 'λ.py' }).filename, 'λ.py');
+  assert.equal(calls.filter(call => call[0] === 'run').length, 0);
+  assert.equal(engine.ready(), true);
+});
+
+test('curated package count is checked before deduplication or dispatch', async t => {
+  const { engine, calls } = await initialized(t);
+  await assert.rejects(engine.loadPackages(Array(LIMITS.packageCount + 1).fill('numpy')), { code: 'INVALID_PACKAGES' });
+  await assert.rejects(engine.loadPackages(Array(100_000).fill('numpy')), { code: 'INVALID_PACKAGES' });
+  assert.equal(calls.filter(call => call[0] === 'loadPackages').length, 0);
+  assert.equal(engine.ready(), true);
+});
+
+test('malformed and oversized matching transport messages fail closed and recover', async t => {
+  for (const malformed of [
+    { type: 'result', stdout: undefined },
+    { type: 'result', stdout: 'x'.repeat(LIMITS.outputChars + 1) },
+    { type: 'result', error: 'x'.repeat(LIMITS.errorChars + 1) },
+    { type: 'result', diagnostic: 'x'.repeat(LIMITS.diagnosticFieldChars + 1) },
+    { type: 'result', tokens: Array(LIMITS.tokenCount + 1).fill({}) },
+    { type: 'result', trace: { instructions: Array(LIMITS.instructionCount + 1).fill({}) } },
+    { type: 'result', trace: [] },
+    { type: 'result', trace: new Map() },
+    { type: 'result', extra: 'x'.repeat(LIMITS.resultChars) },
+    { type: 'result', stdout: [], duration: 'bad' },
+    { type: 'result', errorLine: -1 },
+    { type: 'result', errorKind: 'unknown' },
+    { type: 'result', id: '1' },
+    { type: 'unknown' },
+  ]) {
+    const { engine, transports } = await initialized(t);
+    const running = engine.run('pass');
+    transports[0].emit({ ...resultMessage(engine), ...malformed });
+    await assert.rejects(running, { code: 'RUNTIME_FAILURE' });
+    assert.equal(engine.getState().status, 'initializing');
+    const recovery = engine.initialize();
+    transports[1].emit({ type: 'ready', version: '3.13.2' });
+    await recovery;
+    assert.equal(engine.ready(), true);
+  }
+});
+
+test('package response collections and errors cannot exceed the curated protocol bounds', async t => {
+  for (const bad of [
+    { results: Array(LIMITS.packageCount * 2 + 1).fill({ id: 'numpy', loaded: true }) },
+    { results: [{ id: 'numpy', error: 'x'.repeat(LIMITS.packageErrorChars + 1) }] },
+    { results: [{ id: 'numpy', loaded: true }], loadedPackageIds: Array(LIMITS.packageCount + 1).fill('numpy') },
+    { results: [{ id: 'numpy', loaded: true }], loadedRuntimeNames: Array(LIMITS.runtimePackageCount + 1).fill('numpy') },
+  ]) {
+    const { engine, transports } = await initialized(t);
+    const pending = engine.loadPackages(['numpy']);
+    transports[0].emit({ type: 'package-result', id: engine.getState().requestId, ...bad });
+    await assert.rejects(pending, { code: 'RUNTIME_FAILURE' });
+    assert.equal(engine.getAvailablePackages()[0].status, 'unloaded');
+  }
+});
+
 test('operations forward identity and filename and return serializable structured results', async t => {
   const { engine, transports, calls } = await initialized(t);
   for (const operation of ['run', 'compile', 'inspect', 'diagnose']) {
@@ -148,7 +220,7 @@ test('streaming ignores regressions and flushes final chunks exactly once', asyn
   });
   const pending = engine.run('pass'), id = engine.getState().requestId;
   for (const text of ['one', 'on', 'one']) transports[0].emit({ type: 'stream', id, stdout: text, stderr: '' });
-  transports[0].emit({ type: 'result', id, stdout: 'one two', stderr: 'warning' });
+  transports[0].emit(resultMessage(engine, { stdout: 'one two', stderr: 'warning' }));
   const result = await pending;
   assert.equal(stdout.join(''), result.stdout);
   assert.equal(stderr.join(''), result.stderr);
@@ -160,10 +232,12 @@ test('streaming ignores regressions and flushes final chunks exactly once', asyn
 test('late results and streams cannot complete a newer request', async t => {
   const { engine, transports, results } = await initialized(t);
   const first = engine.run('pass'), oldId = engine.getState().requestId;
-  transports[0].emit({ type: 'result', id: oldId, stdout: 'first' });
+  transports[0].emit(resultMessage(engine, { stdout: 'first' }));
   await first;
   const second = engine.run('pass');
   transports[0].emit({ type: 'result', id: oldId, stdout: 'stale' });
+  transports[0].emit({ type: 'result', id: oldId, extra: 'x'.repeat(LIMITS.resultChars + 1) });
+  transports[0].emit({ type: 'unknown', id: oldId, extra: 'x'.repeat(LIMITS.resultChars + 1) });
   transports[0].emit({ type: 'stream', id: oldId, stdout: 'stale' });
   assert.equal(engine.getState().status, 'running');
   transports[0].emit(resultMessage(engine, { stdout: 'second' }));
@@ -397,7 +471,7 @@ test('cancel replaces an active run and stale output cannot complete the next ru
   transports[1].emit({ type: 'result', id: oldId, stdout: 'old' });
   assert.equal(engine.getState().requestId, newId);
   assert.equal(engine.getState().status, 'running');
-  transports[1].emit({ type: 'result', id: newId, stdout: 'new\n' });
+  transports[1].emit(resultMessage(engine, { stdout: 'new\n' }));
   assert.equal((await second).stdout, 'new\n');
   assert.deepEqual(results.map(result => result.stdout), ['new\n']);
 });

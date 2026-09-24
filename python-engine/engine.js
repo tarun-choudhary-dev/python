@@ -1,4 +1,4 @@
-import { EXECUTION_TIMEOUT_MS, PACKAGE_LOAD_TIMEOUT_MS, PYODIDE_VERSION } from '../runtime/config.js';
+import { EXECUTION_TIMEOUT_MS, LIMITS, PACKAGE_LOAD_TIMEOUT_MS, PYODIDE_VERSION } from '../runtime/config.js';
 import { PACKAGE_BY_ID, PYTHON_PACKAGES } from '../runtime/packages.js';
 import { createEngineResult, validateOutput } from './result.js';
 import { ENGINE_CAPABILITIES, PythonEngineError } from './protocol.js';
@@ -76,7 +76,7 @@ export class PythonEngine {
   loadPackages(packageIds) {
     try { this._assertAvailable(); }
     catch (error) { return Promise.reject(error); }
-    if (!Array.isArray(packageIds) || !packageIds.length)
+    if (!Array.isArray(packageIds) || !packageIds.length || packageIds.length > LIMITS.packageCount)
       return Promise.reject(new PythonEngineError('Select one or more IDs from the curated package catalog.', 'INVALID_PACKAGES'));
     const ids = [...new Set(packageIds)];
     if (ids.some(id => typeof id !== 'string' || !PACKAGE_BY_ID.has(id)))
@@ -190,8 +190,8 @@ export class PythonEngine {
         const raw = Array.isArray(payload.results) ? payload.results.find(item => item?.id === id) : null;
         const loaded = raw?.loaded === true || this.packageStates[id].status === 'loaded';
         if (loaded) confirmed.add(id);
-        const error = typeof raw?.error === 'string' ? raw.error.slice(0, 500) :
-          typeof payload.error === 'string' ? payload.error.slice(0, 500) : 'The runtime did not confirm that the package loaded.';
+        const error = typeof raw?.error === 'string' ? raw.error.slice(0, LIMITS.packageErrorChars) :
+          typeof payload.error === 'string' ? payload.error.slice(0, LIMITS.packageErrorChars) : 'The runtime did not confirm that the package loaded.';
         this.packageStates[id] = loaded ? { status: 'loaded', error: '' } : { status: 'error', error };
         return { id, loaded, ...(loaded ? {} : { error }) };
       });
@@ -235,7 +235,7 @@ export class PythonEngine {
   _fatal(cause, code = 'RUNTIME_FAILURE') {
     const initializing = Boolean(this.initializer);
     const recovering = Boolean(this.recovery);
-    const error = new PythonEngineError(cause instanceof Error ? cause.message.slice(0, 1000) : 'The Python runtime failed.', code === 'TIMEOUT' ? 'TIMEOUT' : 'RUNTIME_FAILURE');
+    const error = new PythonEngineError(cause instanceof Error ? cause.message.slice(0, LIMITS.fatalErrorChars) : 'The Python runtime failed.', code === 'TIMEOUT' ? 'TIMEOUT' : 'RUNTIME_FAILURE');
     this._destroy(error, recovering ? 'unavailable' : initializing ? 'idle' : 'stopped');
     this._emit('onError', error);
     if (!recovering && !initializing && this.status !== 'disposed') this._recover().catch(() => {});

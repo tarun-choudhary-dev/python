@@ -1,5 +1,5 @@
 import { loadInspectorSource, loadPackageAssets, loadRuntimeAssets } from './assets.js';
-import { LOAD_TIMEOUT_MS, MAX_OUTPUT_CHARS } from './config.js';
+import { LIMITS, LOAD_TIMEOUT_MS } from './config.js';
 import { PYTHON_PACKAGES } from './packages.js';
 
 /** The page talks to an opaque-origin sandbox through a private MessageChannel. */
@@ -7,6 +7,7 @@ export class PyodideRuntime {
   constructor(onMessage) { this.onMessage = onMessage; this.generation = 0; }
   async initialize() {
     this.dispose();
+    this.connected = false;
     const generation = this.generation;
     this.timer = setTimeout(() => this.fail('Python took too long to load. Check your connection and retry.', 'TIMEOUT'), LOAD_TIMEOUT_MS);
     try {
@@ -23,11 +24,17 @@ export class PyodideRuntime {
         const channel = new MessageChannel();
         this.port = channel.port1;
         this.port.onmessage = ({ data }) => {
-          if (generation !== this.generation || !data || typeof data !== 'object') return;
-          if (data.type === 'connected') this.port.postMessage({ type: 'init', assets, maxOutput: MAX_OUTPUT_CHARS, packageCatalog: PYTHON_PACKAGES });
+          if (generation !== this.generation) return;
+          if (!data || typeof data !== 'object' || Array.isArray(data)) return this.fail('The Python sandbox sent an invalid response.');
+          if (data.type === 'connected') {
+            if (this.connected) return this.fail('The Python sandbox connected more than once.');
+            this.connected = true;
+            this.port.postMessage({ type: 'init', assets, limits: LIMITS, packageCatalog: PYTHON_PACKAGES });
+          }
           else if (data.type === 'ready') { clearTimeout(this.timer); this.onMessage(data); }
           else if (data.type === 'fatal') this.fail(typeof data.message === 'string' ? data.message : 'Python could not start. Retry to reload it.', data.code);
           else if (data.type === 'result' || data.type === 'stream' || data.type === 'package-result') this.onMessage(data);
+          else this.fail('The Python sandbox sent an unknown response.');
         };
         this.port.onmessageerror = () => {
           if (generation === this.generation) this.fail('The Python sandbox sent an unreadable response.');
@@ -66,11 +73,11 @@ export class PyodideRuntime {
       this.port.postMessage({ type: 'load-packages', id, ...assets });
     } catch (error) {
       if (generation !== this.generation) return;
-      const message = error instanceof Error ? error.message : 'Packages could not be prepared.';
+      const message = error instanceof Error ? error.message.slice(0, LIMITS.packageErrorChars) : 'Packages could not be prepared.';
       this.onMessage({ type: 'package-result', id, results: packageIds.map(packageId => ({ id: packageId, error: message })), loadedRuntimeNames: [] });
     }
   }
-  fail(message, code) { this.dispose(); this.onMessage({ type: 'fatal', message, code }); }
+  fail(message, code) { this.dispose(); this.onMessage({ type: 'fatal', message: message.slice(0, LIMITS.fatalErrorChars), code }); }
   dispose() {
     this.generation++;
     clearTimeout(this.timer);

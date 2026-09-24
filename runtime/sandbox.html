@@ -10,17 +10,36 @@
     if (connected || event.source !== parent || event.data !== 'pylab-connect' || event.ports.length !== 1) return;
     connected = true;
     const port = event.ports[0];
-    let worker;
+    let worker, limits;
     port.onmessage = ({ data }) => {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
       if (data.type === 'init' && !worker) {
+        if (!data.assets || typeof data.assets.workerSource !== 'string' || !data.limits ||
+            !Number.isSafeInteger(data.limits.sourceChars) || !Number.isSafeInteger(data.limits.filenameChars) ||
+            !Number.isSafeInteger(data.limits.packageCount) || !Array.isArray(data.packageCatalog)) {
+          port.postMessage({ type: 'fatal', message: 'The Python sandbox received invalid initialization data.' });
+          return;
+        }
+        limits = data.limits;
         const url = URL.createObjectURL(new Blob([data.assets.workerSource], { type: 'text/javascript' }));
         worker = new Worker(url, { name: 'pylab-python' });
         URL.revokeObjectURL(url);
-        worker.onmessage = event => port.postMessage(event.data);
+        worker.onmessage = event => {
+          const reply = event.data;
+          if (reply && typeof reply === 'object' && !Array.isArray(reply) &&
+              ['ready', 'stream', 'result', 'package-result', 'fatal'].includes(reply.type)) port.postMessage(reply);
+          else port.postMessage({ type: 'fatal', message: 'The Python worker sent an invalid message.' });
+        };
         worker.onerror = () => port.postMessage({ type: 'fatal', message: 'The Python worker stopped unexpectedly. Retry to start a fresh runtime.' });
         worker.onmessageerror = () => port.postMessage({ type: 'fatal', message: 'The Python worker sent an unreadable response.' });
-        worker.postMessage({ type: 'init', assets: data.assets, maxOutput: data.maxOutput, packageCatalog: data.packageCatalog });
+        worker.postMessage({ type: 'init', assets: data.assets, limits: data.limits, packageCatalog: data.packageCatalog });
       } else if ((data.type === 'run' || data.type === 'analysis') && worker) {
+        if (!Number.isSafeInteger(data.id) || data.id < 1 || typeof data.source !== 'string' ||
+            data.source.length > limits.sourceChars || !data.source.trim() ||
+            typeof data.filename !== 'string' || !data.filename || data.filename.length > limits.filenameChars ||
+            /[\x00-\x1f\x7f]/.test(data.filename) ||
+            (data.type === 'analysis' && (!['compile', 'inspect', 'diagnose'].includes(data.operation) ||
+              typeof data.inspector !== 'string'))) return;
         const request = { type: data.type, id: data.id, source: data.source, filename: data.filename };
         if (data.type === 'analysis') {
           request.operation = data.operation;
@@ -28,6 +47,9 @@
         }
         worker.postMessage(request);
       } else if (data.type === 'load-packages' && worker) {
+        if (!Number.isSafeInteger(data.id) || data.id < 1 || !Array.isArray(data.packages) ||
+            data.packages.length > limits.packageCount || !Array.isArray(data.errors) ||
+            data.errors.length > limits.packageCount) return;
         worker.postMessage({ type: 'load-packages', id: data.id, packages: data.packages, errors: data.errors, files: data.files });
       } else if (data.type === 'stop') {
         worker?.terminate();

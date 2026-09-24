@@ -17,13 +17,29 @@ def _pylab_make_inspector():
     disassemble, instructions, code_type = dis.dis, dis.get_instructions, types.CodeType
     original_stdout, original_stderr = sys.stdout, sys.stderr
     original_stdin = sys.stdin
-    limit = 100_000
+    limits = {}
+    limit = 0
+
+    def utf16_prefix(value, budget):
+        used = 0
+        for index, character in enumerate(value):
+            width = 2 if ord(character) > 0xffff else 1
+            if used + width > budget:
+                return value[:index], used
+            used += width
+        return value, used
 
     class LimitedText(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.units = 0
+
         def write(self, value):
-            remaining = limit - self.tell()
+            remaining = limit - self.units
             if remaining > 0:
-                super().write(value[:remaining])
+                piece, units = utf16_prefix(value, remaining)
+                super().write(piece)
+                self.units += units
             return len(value)
 
     def inspect_tokens(source):
@@ -32,24 +48,24 @@ def _pylab_make_inspector():
         truncated = False
         try:
             for item in tokenize.generate_tokens(io.StringIO(source).readline):
-                if len(items) >= 1500:
+                if len(items) >= limits['tokenCount']:
                     truncated = True
                     break
                 items.append({
                     "type": token.tok_name.get(item.type, "UNKNOWN"),
-                    "value": item.string[:1000],
+                    "value": item.string[:limits['tokenValueChars']],
                     "line": item.start[0],
                     "column": item.start[1] + 1,
                     "endLine": item.end[0],
                     "endColumn": item.end[1] + 1,
                 })
         except (tokenize.TokenError, IndentationError) as error:
-            warning = f"SYNTAX ERROR — tokenization stopped: {error}"
+            warning = utf16_prefix(f"SYNTAX ERROR — tokenization stopped: {error}", limit)[0]
         return items, warning, truncated
 
     def inspect_ast(root):
         text = LimitedText()
-        remaining = 500
+        remaining = limits['astNodeCount']
         nodes = []
 
         def label(node):
@@ -66,7 +82,7 @@ def _pylab_make_inspector():
         def detail_fields(node):
             fields = []
             for key, value in ast.iter_fields(node):
-                if len(fields) >= 8:
+                if len(fields) >= limits['astFieldCount']:
                     break
                 if key == "ctx" or (value is None and key != "value"):
                     continue
@@ -117,24 +133,24 @@ def _pylab_make_inspector():
 
         def visit(code, parent_id=None, depth=0):
             nonlocal truncated
-            if len(objects) >= 40 or depth > 12:
+            if len(objects) >= limits['codeObjectCount'] or depth > limits['codeDepth']:
                 truncated = True
                 return
             code_id = f"co-{len(objects)}"
             def constant_text(value):
-                return f"<code object {value.co_name}>" if isinstance(value, code_type) else repr(value)[:120]
+                return f"<code object {value.co_name[:limits['metadataNameChars']]}>" if isinstance(value, code_type) else repr(value)[:limits['metadataConstantChars']]
             objects.append({"id": code_id, "parentId": parent_id,
-                            "name": code.co_name, "firstLine": code.co_firstlineno,
+                            "name": code.co_name[:limits['metadataNameChars']], "firstLine": code.co_firstlineno,
                             "depth": depth, "argcount": code.co_argcount,
                             "nlocals": code.co_nlocals, "stacksize": code.co_stacksize,
                             "flags": code.co_flags, "bytecodeLength": len(code.co_code),
-                            "constants": [constant_text(value) for value in code.co_consts[:200]],
-                            "names": list(code.co_names[:200]),
-                            "varnames": list(code.co_varnames[:200]),
-                            "metadataTruncated": any(len(values) > 200 for values in
+                            "constants": [constant_text(value) for value in code.co_consts[:limits['codeMetadataCount']]],
+                            "names": [name[:limits['metadataNameChars']] for name in code.co_names[:limits['codeMetadataCount']]],
+                            "varnames": [name[:limits['metadataNameChars']] for name in code.co_varnames[:limits['codeMetadataCount']]],
+                            "metadataTruncated": any(len(values) > limits['codeMetadataCount'] for values in
                                                      (code.co_consts, code.co_names, code.co_varnames))})
             for instruction in instructions(code, show_caches=False, adaptive=False):
-                if len(mapped) >= 4000:
+                if len(mapped) >= limits['instructionCount']:
                     truncated = True
                     break
                 position = instruction.positions
@@ -145,7 +161,7 @@ def _pylab_make_inspector():
                 mapped.append({"id": f"{code_id}:{instruction.offset}",
                                "codeId": code_id, "offset": instruction.offset,
                                "opcode": instruction.opname, "arg": instruction.arg,
-                               "argrepr": instruction.argrepr[:200], "source": source})
+                               "argrepr": instruction.argrepr[:limits['instructionArgChars']], "source": source})
             for value in code.co_consts:
                 if isinstance(value, code_type):
                     visit(value, code_id, depth + 1)
@@ -156,11 +172,11 @@ def _pylab_make_inspector():
 
     def describe(root):
         text = LimitedText()
-        remaining_objects = 40
+        remaining_objects = limits['codeObjectCount']
 
         def visit(code, depth=0):
             nonlocal remaining_objects
-            if remaining_objects <= 0 or depth > 12:
+            if remaining_objects <= 0 or depth > limits['codeDepth']:
                 text.write("\n[Further nested code objects omitted]\n")
                 return
             remaining_objects -= 1
@@ -196,11 +212,11 @@ def _pylab_make_inspector():
 
     def inspect_bytecode(root):
         text = LimitedText()
-        remaining_objects = 40
+        remaining_objects = limits['codeObjectCount']
 
         def visit(code, depth=0):
             nonlocal remaining_objects
-            if remaining_objects <= 0 or depth > 12:
+            if remaining_objects <= 0 or depth > limits['codeDepth']:
                 text.write("[Further nested code objects omitted]\n")
                 return
             remaining_objects -= 1
@@ -226,7 +242,11 @@ def _pylab_make_inspector():
         visit(root)
         return text.getvalue()
 
-    def operate(source, filename="main.py"):
+    def operate(source, filename, limits_json):
+        nonlocal limit
+        limits.clear()
+        limits.update(json.loads(limits_json))
+        limit = limits['analysisFieldChars']
         result = {
             "tokens": [], "tokenError": "", "tokensTruncated": False,
             "astTree": "", "astDump": "", "astError": "", "compileError": "",
@@ -244,26 +264,33 @@ def _pylab_make_inspector():
             try:
                 tree = ast.parse(source, filename=filename, mode='exec', type_comments=True)
             except SyntaxError as error:
-                result['astError'] = f"SYNTAX ERROR\n{error.__class__.__name__}: {error.msg} (line {error.lineno or '?'})"
-                result['compileError'] = result['astError'] + "\nNo code object or bytecode was produced."
+                result['astError'] = utf16_prefix(f"SYNTAX ERROR\n{error.__class__.__name__}: {error.msg} (line {error.lineno or '?'})", limit)[0]
+                result['compileError'] = utf16_prefix(result['astError'] + "\nNo code object or bytecode was produced.", limit)[0]
                 raise
             result['astTree'], result['trace']['astNodes'] = inspect_ast(tree)
-            result['astDump'] = ast.dump(tree, indent=2)[:limit]
+            result['astDump'] = utf16_prefix(ast.dump(tree, indent=2), limit)[0]
             code = compile_source(source, filename, 'exec', dont_inherit=True, optimize=0)
             result['trace'].update(inspect_locations(code))
             result['codeObject'] = describe(code)
             result['bytecode'] = inspect_bytecode(code)
             listing = LimitedText()
-            disassemble(code, file=listing, depth=12, show_caches=False, adaptive=False)
+            disassemble(code, file=listing, depth=limits['codeDepth'], show_caches=False, adaptive=False)
             result['disassembly'] = listing.getvalue()
         except BaseException as error:
             if isinstance(error, SyntaxError) and not result['compileError']:
-                result['compileError'] = f"SYNTAX ERROR\n{error.__class__.__name__}: {error.msg} (line {error.lineno or '?'})\nNo code object or bytecode was produced."
+                result['compileError'] = utf16_prefix(f"SYNTAX ERROR\n{error.__class__.__name__}: {error.msg} (line {error.lineno or '?'})\nNo code object or bytecode was produced.", limit)[0]
             # The wrapper's exec frame is an implementation detail, not user code.
             trace = error.__traceback__
             if trace is not None:
                 trace = trace.tb_next
-            result['error'] = ''.join(traceback.format_exception(type(error), error, trace))[:limit]
+            parts, remaining = [], limit
+            for part in traceback.TracebackException(type(error), error, trace, limit=20).format():
+                if remaining <= 0:
+                    break
+                piece, units = utf16_prefix(part, remaining)
+                parts.append(piece)
+                remaining -= units
+            result['error'] = ''.join(parts)
             if isinstance(error, SyntaxError):
                 result['errorLine'] = error.lineno or 0
             else:

@@ -32,6 +32,52 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
     const frame = document.querySelector('iframe');
     assert(frame.hidden && frame.getAttribute('sandbox') === 'allow-scripts' && frame.contentDocument === null,
       'runtime iframe is hidden and opaque-origin');
+    for (const property of ['document', 'localStorage', 'sessionStorage', 'indexedDB']) {
+      let blocked = false;
+      try { void frame.contentWindow[property]; } catch (error) { blocked = error.name === 'SecurityError'; }
+      assert(blocked, `parent cannot read sandbox ${property} across the opaque origin`);
+    }
+    const sandboxHtml = await (await fetch(new URL('runtime/sandbox.html', entry))).text();
+    const probeCode = `<script>(async () => {
+      const observed = {};
+      for (const name of ['localStorage', 'sessionStorage']) {
+        try { void window[name]; observed[name] = false; }
+        catch (error) { observed[name] = error.name === 'SecurityError'; }
+      }
+      try { void parent.document.body; observed.parentDOM = false; }
+      catch (error) { observed.parentDOM = error.name === 'SecurityError'; }
+      try { indexedDB.open('phase6-probe'); observed.indexedDB = false; }
+      catch (error) { observed.indexedDB = error.name === 'SecurityError'; }
+      try { await caches.open('phase6-probe'); observed.caches = false; }
+      catch (error) { observed.caches = error.name === 'SecurityError'; }
+      let violation = false;
+      addEventListener('securitypolicyviolation', event => {
+        if (event.violatedDirective === 'connect-src') violation = true;
+      });
+      try { await fetch('https://example.com/phase6-probe'); observed.fetch = false; }
+      catch { observed.fetch = violation; }
+      await new Promise(resolve => setTimeout(resolve, 0));
+      observed.fetch = observed.fetch || violation;
+      parent.postMessage({ phase6Probe: observed }, '*');
+    })();</script>`;
+    const probeFrame = document.createElement('iframe');
+    probeFrame.hidden = true;
+    probeFrame.setAttribute('sandbox', 'allow-scripts');
+    const probeResult = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Sandbox policy probe timed out')), 5000);
+      addEventListener('message', function received(event) {
+        if (event.source !== probeFrame.contentWindow || !event.data?.phase6Probe) return;
+        clearTimeout(timer);
+        removeEventListener('message', received);
+        resolve(event.data.phase6Probe);
+      });
+    });
+    probeFrame.srcdoc = sandboxHtml.replace('</body>', probeCode + '</body>');
+    document.body.append(probeFrame);
+    const observed = await probeResult;
+    probeFrame.remove();
+    for (const name of ['localStorage', 'sessionStorage', 'parentDOM', 'indexedDB', 'caches', 'fetch'])
+      assert(observed[name] === true, `opaque sandbox denies ${name} in a policy probe`);
     assert(engine.capabilities.compile && engine.capabilities.inspect && engine.capabilities.streamingOutput,
       'capabilities are available to API consumers');
 
@@ -81,6 +127,27 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
       'each run has fresh user globals and remains inspection-free after analysis');
     result = await run('print("x" * 200000)');
     assert(result.stdout.length + result.stderr.length <= 100000 && result.outputTruncated, 'execution output stays within shared limit');
+    result = await run('import sys\nsys.stdout.write("x" * 100000)');
+    assert(result.stdout.length === 100000 && !result.outputTruncated, 'stdout exactly at the shared limit is retained');
+    result = await run('import sys\nsys.stdout.write("x" * 100001)');
+    assert(result.stdout.length === 100000 && result.outputTruncated, 'stdout one character over is truncated');
+    result = await run('import sys\nsys.stderr.write("x" * 100001)');
+    assert(result.stderr.length === 100000 && result.outputTruncated, 'stderr one character over is truncated');
+    result = await run('import sys\nsys.stdout.write("x" * 60000)\nsys.stderr.write("y" * 40001)');
+    assert(result.stdout.length === 60000 && result.stderr.length === 40000 && result.outputTruncated,
+      'stdout and stderr share one exact budget');
+    result = await run('import sys\nfor _ in range(300): sys.stdout.write("x" * 1000)');
+    assert(result.stdout.length === 100000 && result.outputTruncated, 'repeated output stays bounded');
+    result = await run('raise Exception("x" * 250000)');
+    assert(result.status === 'failed' && result.error.length <= 100000 && result.diagnostics[0].message.length <= 100000,
+      'large Python exception and diagnostic are bounded');
+    result = await run('raise Exception("\\U0001F642" * 60000)');
+    assert(result.status === 'failed' && result.error.length <= 100000 && engine.ready(),
+      'Unicode exception text respects the UTF-16 limit without restarting');
+    result = await run('def f(): return f()\nf()');
+    assert(result.error.includes('RecursionError') && result.error.length <= 100000, 'deep recursion error remains bounded');
+    result = await run('x = "A" * 2000000\nprint(len(x))');
+    assert(result.stdout === '2000000\n' && engine.ready(), 'moderate allocation completes without corrupting lifecycle');
 
     for (const name of ['window', 'document', 'fetch', 'eval', 'XMLHttpRequest']) {
       result = await run('from js import ' + name);
@@ -88,6 +155,10 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
     }
     result = await run('import pyodide_js');
     assert(result.error?.includes('ModuleNotFoundError'), 'public JavaScript runtime bridge stays removed');
+    for (const name of ['localStorage', 'sessionStorage', 'indexedDB', 'caches', 'WebSocket', 'EventSource', 'XMLHttpRequest', 'navigator', 'parent', 'top']) {
+      result = await run('from js import ' + name);
+      assert(result.error?.includes('ImportError'), 'Python has no exposed browser capability: ' + name);
+    }
     result = await run('import urllib.request\nurllib.request.urlopen("https://example.com/engine-test")');
     assert(result.status === 'failed', 'Python HTTP access is unavailable');
     result = await run('import os\nprint(os.path.exists("C:/Users"))');

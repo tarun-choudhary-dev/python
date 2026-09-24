@@ -137,16 +137,16 @@ The existing security boundary is retained:
 
 - The runtime iframe uses `sandbox="allow-scripts"` with an opaque origin.
 - Its worker inherits restrictive CSP, including `connect-src 'none'`.
-- Python cannot use browser fetch, DOM, host window or the public JavaScript runtime bridge.
+- The public `js`/`pyodide_js` bridge is removed. Chromium tests confirm attempted Python imports of common DOM, network and storage APIs fail.
 - Runtime and package assets are fetched by the host from the pinned CDN; the worker's replacement fetch has only a fixed in-memory asset map and no network fallback.
 - Python has a virtual in-memory filesystem, not access to the host filesystem.
-- Source, output and inspection artifacts are bounded. The execution watchdog terminates the sandbox, including an infinite loop.
+- Source, output, exception text and inspection artifacts are bounded. The execution watchdog terminates the sandbox, including an infinite loop.
 - Operation IDs and runtime generations reject stale streams, results, package confirmations and lifecycle messages.
-- Worker messages are untrusted and sanitized before they reach consumers. Consumers must render strings as inert text.
+- Matching Worker replies are validated and size-checked before they reach consumers. Consumers must render strings as inert text.
 
-Default execution/analysis timeout is 15 seconds; package loading and runtime loading allow 120 seconds. Source is limited to 100,000 JavaScript characters, stdout/stderr share a 100,000-character budget, and compiler artifacts are bounded to 1,500 tokens, 500 AST nodes, 40 code objects and 4,000 instructions. See the API contract for details.
+Default execution/analysis timeout is 15 seconds; package loading and runtime loading allow 120 seconds. Source is limited to 100,000 UTF-16 code units, stdout/stderr share a 100,000-character budget, exception text is capped at 100,000 characters, and compiler artifacts are bounded to 1,500 tokens, 500 AST nodes, 40 code objects and 4,000 instructions. Matching result messages are limited to 4,000,000 serialized characters. See the API contract for details.
 
-Normal runs use fresh user globals but share the interpreter's modules and virtual filesystem. Use `reset()` when those must be discarded. CPython introspection and Pyodide are not themselves a hostile-code sandbox; the browser isolation is the security boundary. Browsers do not offer a portable hard memory quota for workers, so extreme allocation can still exhaust a tab. Deploy on an origin without sensitive same-origin services and preserve the sandbox/CSP.
+Normal runs use fresh user globals but share the interpreter's modules and virtual filesystem. Use `reset()` when those must be discarded. CPython introspection and Pyodide are not themselves a hostile-code sandbox; the browser isolation is the security boundary. The observed HTTP failure and bridge tests cover the tested Chromium runtime; the CSP and offline Worker fetch map are the architectural network restrictions. Browser storage is unavailable through the exposed Python API, while the Python virtual filesystem persists until reset. Browsers do not offer a portable hard memory quota for workers, so extreme allocation can still exhaust a tab. Deploy on an origin without sensitive same-origin services and preserve the sandbox/CSP.
 
 The host must permit its local module/runtime assets and downloads from `https://cdn.jsdelivr.net/pyodide/v0.29.3/full/`, and allow the local sandbox iframe. Serve `runtime/sandbox.html` intact; do not give it same-origin sandbox privileges or relax its CSP. No credentials or user source are sent to the CDN. Initial startup needs download access; assets are cached in page memory across resets, not persisted by this engine.
 

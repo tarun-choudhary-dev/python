@@ -1,23 +1,30 @@
-import { EXECUTION_TIMEOUT_MS, MAX_SOURCE_CHARS } from '../runtime/config.js';
+import { EXECUTION_TIMEOUT_MS, LIMITS, MAX_SOURCE_CHARS } from '../runtime/config.js';
 import { PythonEngineError } from './protocol.js';
 
 /** Validate and snapshot public source input before transport submission. */
 export function normalizeRequest(input, options = {}) {
-  const request = typeof input === 'string' ? { ...options, source: input } : input;
-  if (!request || typeof request !== 'object' || Array.isArray(request))
+  if (typeof input !== 'string' && (!input || typeof input !== 'object' || Array.isArray(input)))
     throw new PythonEngineError('Expected Python source or a request object.', 'INVALID_REQUEST');
-  if (typeof request.source !== 'string')
+  let source, filename, timeout;
+  try {
+    source = typeof input === 'string' ? input : input.source;
+    filename = typeof input === 'string' ? options?.filename : input.filename;
+    timeout = typeof input === 'string' ? options?.timeoutMs : input.timeoutMs;
+  } catch {
+    throw new PythonEngineError('The Python request could not be read.', 'INVALID_REQUEST');
+  }
+  if (typeof source !== 'string')
     throw new PythonEngineError('Python source must be a string.', 'INVALID_SOURCE');
-  if (!request.source.trim())
-    throw new PythonEngineError('Python source cannot be empty.', 'EMPTY_SOURCE');
-  if (request.source.length > MAX_SOURCE_CHARS)
+  if (source.length > MAX_SOURCE_CHARS)
     throw new PythonEngineError(`Python source must not exceed ${MAX_SOURCE_CHARS} characters.`, 'SOURCE_TOO_LARGE');
-  const filename = request.filename === undefined ? 'main.py' : request.filename;
-  if (typeof filename !== 'string' || !filename || filename.length > 240 || /[\x00-\x1f\x7f]/.test(filename))
+  if (!source.trim())
+    throw new PythonEngineError('Python source cannot be empty.', 'EMPTY_SOURCE');
+  filename = filename === undefined ? 'main.py' : filename;
+  if (typeof filename !== 'string' || !filename || filename.length > LIMITS.filenameChars || /[\x00-\x1f\x7f]/.test(filename))
     throw new PythonEngineError('The filename must be a non-empty string without control characters.', 'INVALID_FILENAME');
   let timeoutMs;
-  if (request.timeoutMs !== undefined) timeoutMs = validateTimeout(request.timeoutMs, EXECUTION_TIMEOUT_MS);
-  return Object.freeze({ source: request.source, filename, ...(timeoutMs ? { timeoutMs } : {}) });
+  if (timeout !== undefined) timeoutMs = validateTimeout(timeout, EXECUTION_TIMEOUT_MS);
+  return Object.freeze({ source, filename, ...(timeoutMs ? { timeoutMs } : {}) });
 }
 
 export function validateTimeout(value, maximum) {

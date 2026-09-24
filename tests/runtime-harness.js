@@ -106,6 +106,14 @@ print(Image.new("RGB", (1, 1), "red").getpixel((0, 0)))`);
     r = await run('from js import eval'); assert(r.error.includes('ImportError'), 'Python receives no JavaScript eval bridge');
     r = await run('import pyodide_js'); assert(r.error.includes('ModuleNotFoundError'), 'public runtime bridge is removed');
     r = await run('print("x" * 200000)'); assert(r.stdout.length <= 100000 && r.truncated, 'output floods are bounded');
+    r = await run('import sys\nsys.stdout.write("x" * 100000)');
+    assert(r.stdout.length === 100000 && !r.truncated, 'direct Worker stdout keeps exact limit');
+    r = await run('import sys\nsys.stderr.write("x" * 100001)');
+    assert(r.stderr.length === 100000 && r.truncated, 'direct Worker stderr truncates above limit');
+    r = await run('raise Exception("x" * 250000)');
+    assert(r.error.length <= 100000 && r.diagnostic.length <= 100000, 'direct Worker bounds amplified exceptions');
+    r = await run('print("after limits")');
+    assert(r.stdout === 'after limits\n', 'direct Worker remains usable after output and error limits');
     r = await run('print("<script>alert(1)</script>")'); assert(r.stdout.startsWith('<script>'), 'HTML remains output text');
     runtime.run(++id, 'while True:\n    pass');
     await new Promise(resolve => setTimeout(resolve, 150));
@@ -171,6 +179,8 @@ print(Image.new("RGB", (1, 1), "red").getpixel((0, 0)))`);
       r.trace.instructions.some(i => i.opcode === 'LOAD_CONST' && i.source?.column === 8 && i.source?.endColumn === 14), 'real Unicode AST and instruction columns use UTF-8 byte offsets');
     r = await inspect('a = 1\n'.repeat(600));
     assert(r.trace.astNodes.length <= 500 && r.trace.codeObjects.length <= 40 && r.trace.instructions.length <= 4000, 'long source respects all inspection mapping bounds');
+    assert(r.astDump.length <= 100000 && r.astTree.length <= 100000 && r.disassembly.length <= 100000,
+      'direct inspection text stays within field limits');
 
     r = await inspect('x = 10 * 5\nprint(x)');
     const binOp = r.trace.astNodes.find(n => n.type === 'BinOp');

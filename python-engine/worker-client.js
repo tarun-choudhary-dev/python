@@ -1,5 +1,8 @@
 import { PyodideRuntime } from '../runtime/runtime.js';
-import { LOAD_TIMEOUT_MS } from '../runtime/config.js';
+import { LIMITS, LOAD_TIMEOUT_MS } from '../runtime/config.js';
+
+const isRecord = value => value !== null && typeof value === 'object' &&
+  !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 
 /** Private request transport. The runtime adapter owns the opaque iframe and port. */
 export class WorkerClient {
@@ -61,12 +64,29 @@ export class WorkerClient {
 
   _receive(message, generation) {
     if (generation !== this.generation) return;
-    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    if (!isRecord(message)) {
       this._fail(new Error('The Python transport sent an invalid message.'));
+      return;
+    }
+    if (message.type !== 'ready' && message.type !== 'fatal') {
+      if (!Number.isSafeInteger(message.id) || message.id < 1) {
+        this._fail(new Error('The Python transport sent an invalid request ID.'));
+        return;
+      }
+      if (!this.pending.has(message.id)) return;
+    }
+    try {
+      if (JSON.stringify(message).length > LIMITS.resultChars) throw new Error();
+    } catch {
+      this._fail(new Error('The Python transport sent an oversized or invalid message.'));
       return;
     }
     if (message.type === 'ready') {
       if (!this.initializing) return;
+      if (typeof message.version !== 'string' || message.version.length > 64) {
+        this._fail(new Error('The Python transport sent an invalid runtime version.'));
+        return;
+      }
       this.initializing = false;
       clearTimeout(this.initTimer);
       this.initTimer = null;
@@ -74,10 +94,10 @@ export class WorkerClient {
       return;
     }
     if (message.type === 'fatal') {
-      this._fail(new Error(typeof message.message === 'string' ? message.message : 'The Python runtime failed.'), message.code);
+      this._fail(new Error(typeof message.message === 'string' ? message.message.slice(0, LIMITS.fatalErrorChars) : 'The Python runtime failed.'), message.code);
       return;
     }
-    if (!Number.isSafeInteger(message.id)) return;
+    if (!Number.isSafeInteger(message.id) || message.id < 1) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
     if (message.type === 'stream' && pending.operation === 'run') {
@@ -86,12 +106,31 @@ export class WorkerClient {
       return;
     }
     const expected = pending.operation === 'load-packages' ? 'package-result' : 'result';
-    if (message.type !== expected || (message.operation !== undefined && message.operation !== pending.operation) ||
+    if (message.type !== expected || (expected === 'result' && message.operation !== pending.operation) ||
         (expected === 'result' && (!this._validOutput(message) ||
-          (message.error !== undefined && typeof message.error !== 'string') ||
-          (message.duration !== undefined && (!Number.isFinite(message.duration) || message.duration < 0)))) ||
+          typeof message.stdout !== 'string' || typeof message.stderr !== 'string' ||
+          typeof message.truncated !== 'boolean' || typeof message.error !== 'string' ||
+          (message.errorLine !== undefined && (!Number.isSafeInteger(message.errorLine) || message.errorLine < 0)) ||
+          (message.errorKind !== undefined && !['', 'syntax', 'runtime'].includes(message.errorKind)) ||
+          (typeof message.error === 'string' && message.error.length > LIMITS.errorChars) ||
+          ['diagnostic', 'tokenError', 'astError', 'compileError', 'astTree', 'astDump', 'codeObject', 'bytecode', 'disassembly'].some(key =>
+            message[key] !== undefined && (typeof message[key] !== 'string' || message[key].length >
+              (key === 'diagnostic' ? LIMITS.diagnosticFieldChars : LIMITS.analysisFieldChars))) ||
+          (message.tokens !== undefined && (!Array.isArray(message.tokens) || message.tokens.length > LIMITS.tokenCount)) ||
+          (message.trace !== undefined && (!isRecord(message.trace) ||
+            ['astNodes', 'codeObjects', 'instructions'].some((key, index) => message.trace[key] !== undefined &&
+              (!Array.isArray(message.trace[key]) || message.trace[key].length >
+                [LIMITS.astNodeCount, LIMITS.codeObjectCount, LIMITS.instructionCount][index])))) ||
+          !Number.isFinite(message.duration) || message.duration < 0 || message.duration > Number.MAX_SAFE_INTEGER)) ||
         (expected === 'package-result' &&
-          (message.results !== undefined && !Array.isArray(message.results)))) {
+          (!Array.isArray(message.results) || message.results.length > LIMITS.packageCount * 2 ||
+            (message.loadedPackageIds !== undefined && (!Array.isArray(message.loadedPackageIds) ||
+              message.loadedPackageIds.length > LIMITS.packageCount ||
+              message.loadedPackageIds.some(id => typeof id !== 'string' || id.length > LIMITS.packageNameChars))) ||
+            (message.loadedRuntimeNames !== undefined && (!Array.isArray(message.loadedRuntimeNames) ||
+              message.loadedRuntimeNames.length > LIMITS.runtimePackageCount)) ||
+            message.results.some(item => !isRecord(item) || typeof item.id !== 'string' || item.id.length > LIMITS.packageNameChars ||
+              (item.error !== undefined && (typeof item.error !== 'string' || item.error.length > LIMITS.packageErrorChars)))))) {
       this._fail(new Error('The Python transport returned an unexpected response.'));
       return;
     }
@@ -103,7 +142,8 @@ export class WorkerClient {
   _validOutput(message) {
     return (message.stdout === undefined || typeof message.stdout === 'string') &&
       (message.stderr === undefined || typeof message.stderr === 'string') &&
-      (message.truncated === undefined || typeof message.truncated === 'boolean');
+      (message.truncated === undefined || typeof message.truncated === 'boolean') &&
+      (message.stdout?.length ?? 0) + (message.stderr?.length ?? 0) <= LIMITS.outputChars;
   }
 
   _fail(error, code) {

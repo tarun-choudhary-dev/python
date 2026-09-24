@@ -1,4 +1,4 @@
-import { PYODIDE_VERSION } from '../runtime/config.js';
+import { LIMITS, PYODIDE_VERSION } from '../runtime/config.js';
 import { ENGINE_PROTOCOL_VERSION } from './protocol.js';
 import { safeText, safeInteger, validateOutput, processWorkerResult } from './worker-result.js';
 export { validateOutput, processWorkerResult } from './worker-result.js';
@@ -10,7 +10,7 @@ function diagnosticsFor(result, operation) {
   add('syntax', result.astError, result.errorLine);
   if (result.compileError && !result.astError) add('compilation', result.compileError, result.errorLine);
   if (operation === 'run' && result.error && !result.astError && !result.compileError) add('runtime', result.error, result.errorLine);
-  return diagnostics;
+  return diagnostics.slice(0, LIMITS.diagnosticCount);
 }
 
 export function createEngineResult(message, { operation, filename, pythonVersion, requestId, generation }) {
@@ -33,7 +33,7 @@ export function createEngineResult(message, { operation, filename, pythonVersion
       outputTruncated: value.outputTruncated,
       pythonVersion,
       runtime: { name: 'Pyodide', version: PYODIDE_VERSION, pythonVersion },
-      diagnostics: error ? [{ kind, severity: 'error', message: kind === 'syntax' ? safeText(message?.diagnostic) || error : error, line: errorLine }] : [],
+      diagnostics: error ? [{ kind, severity: 'error', message: kind === 'syntax' ? safeText(message?.diagnostic, LIMITS.diagnosticFieldChars) || error : error, line: errorLine }] : [],
     };
   }
   const value = processWorkerResult(message);
