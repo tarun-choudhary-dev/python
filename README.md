@@ -49,8 +49,10 @@ Consumer application / future IDE
           index.js
               |
         PythonEngine
-  lifecycle, promises, limits,
-  validation, packages, events
+  lifecycle, packages, events
+              |
+   request.js + WorkerClient
+  validation, IDs, matching, timeouts
               |
        PyodideRuntime
   fixed asset downloads + channel
@@ -64,19 +66,25 @@ Consumer application / future IDE
       CPython + executor.py
           | optional analysis
         inspector.py
+              |
+  worker-result.js + result.js
+  internal validation + public mapping
 ~~~
 
 `run` compiles and executes directly through `executor.py`; it does not load or produce tokens, AST, code-object metadata, bytecode or disassembly. `compile`, `inspect` and `diagnose` load `inspector.py` on demand and never execute source. Compilation returns serializable metadata, not a live code object, executable handle or transferable CPython bytecode format. Inspection locations are authentic CPython positions.
 
-There is one runtime implementation. The engine and runtime modules separate lifecycle/data validation from browser isolation and CPython execution. They have no dependency on the removed PYLAB application.
+There is one runtime implementation. `PythonEngine` owns public lifecycle and package state; the private WorkerClient owns request identity, matching, timeouts and transport failures. The runtime adapter retains the opaque iframe and MessageChannel. Worker responses are validated before public result mapping. These modules have no dependency on the removed PYLAB application.
 
 ~~~text
 index.js                   Public entry point
 python-engine/
   index.js                 Factory and public exports
-  engine.js                Lifecycle, requests, events, package state
-  protocol.js              Capabilities, request validation, errors
-  result.js                Defensive worker-result validation
+  engine.js                Public lifecycle, events, package state
+  worker-client.js         Private request IDs, matching and timeouts
+  request.js               Source request validation
+  protocol.js              Capabilities and public errors
+  worker-result.js         Defensive worker-data validation
+  result.js                Public result construction
   README.md                API contract
 runtime/
   config.js                Pinned runtime and limits

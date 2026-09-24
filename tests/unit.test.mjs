@@ -351,6 +351,22 @@ test('synchronous and asynchronous transport failures reject and invalidate runt
   }
 });
 
+test('WorkerClient rejects a malformed matching response and ignores an old generation', async t => {
+  const { engine, transports } = await initialized(t);
+  const first = engine.run('print(1)');
+  const id = engine.getState().requestId;
+  transports[0].emit({ type: 'result', id, operation: 'inspect', stdout: 'wrong operation' });
+  await assert.rejects(first, { code: 'RUNTIME_FAILURE' });
+  assert.equal(transports[0].disposed, 1);
+  const recovery = engine.initialize();
+  transports[0].emit({ type: 'result', id, stdout: 'late' });
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  const second = engine.run('print(2)');
+  transports[1].emit(resultMessage(engine, { stdout: '2\n' }));
+  assert.equal((await second).stdout, '2\n');
+});
+
 test('CSP, iframe isolation and absent JS bridges remain in production sources', async () => {
   const [sandbox, runtime, worker] = await Promise.all(['sandbox.html', 'runtime.js', 'worker.js']
     .map(name => readFile(new URL('../runtime/' + name, import.meta.url), 'utf8')));
@@ -362,7 +378,8 @@ test('CSP, iframe isolation and absent JS bridges remain in production sources',
   assert.match(worker, /unregisterJsModule\('pyodide_js'\)/);
   assert.match(worker, /if \(!responses.has\(url\)\) throw/);
   assert.match(sandbox, /worker\?\.terminate\(\)/);
-  assert.match(sandbox, /operation: data.operation, filename: data.filename/);
+  assert.match(sandbox, /data.type === 'run' \|\| data.type === 'analysis'/);
+  assert.match(sandbox, /request.operation = data.operation/);
 });
 
 test('engine modules have no editor, application or rendering dependencies', async () => {

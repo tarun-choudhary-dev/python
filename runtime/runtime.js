@@ -29,6 +29,9 @@ export class PyodideRuntime {
           else if (data.type === 'fatal') this.fail(typeof data.message === 'string' ? data.message : 'Python could not start. Retry to reload it.');
           else if (data.type === 'result' || data.type === 'stream' || data.type === 'package-result') this.onMessage(data);
         };
+        this.port.onmessageerror = () => {
+          if (generation === this.generation) this.fail('The Python sandbox sent an unreadable response.');
+        };
         this.frame.contentWindow.postMessage('pylab-connect', '*', [channel.port2]);
       }, { once: true });
       document.body.append(this.frame);
@@ -38,13 +41,13 @@ export class PyodideRuntime {
   }
   async run(id, source, operation = 'run', filename = 'main.py') {
     if (operation === 'run') {
-      this.port.postMessage({ type: 'run', id, source, operation, filename });
+      this.port.postMessage({ type: 'run', id, source, filename });
       return;
     }
     const generation = this.generation;
     const inspector = await loadInspectorSource();
     if (generation !== this.generation || !this.port) return;
-    this.port.postMessage({ type: 'run', id, source, operation, filename, inspector });
+    this.port.postMessage({ type: 'analysis', id, source, operation, filename, inspector });
   }
   async loadPackages(id, packageIds) {
     const generation = this.generation;

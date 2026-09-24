@@ -1,8 +1,9 @@
 import { EXECUTION_TIMEOUT_MS, PACKAGE_LOAD_TIMEOUT_MS, PYODIDE_VERSION } from '../runtime/config.js';
 import { PACKAGE_BY_ID, PYTHON_PACKAGES } from '../runtime/packages.js';
-import { PyodideRuntime } from '../runtime/runtime.js';
 import { createEngineResult, validateOutput } from './result.js';
-import { ENGINE_CAPABILITIES, normalizeRequest, PythonEngineError, validateTimeout } from './protocol.js';
+import { ENGINE_CAPABILITIES, PythonEngineError } from './protocol.js';
+import { normalizeRequest, validateTimeout } from './request.js';
+import { WorkerClient } from './worker-client.js';
 
 const OPERATION_STATUS = { run: 'running', compile: 'compiling', inspect: 'inspecting', diagnose: 'diagnosing' };
 
@@ -18,10 +19,9 @@ export class PythonEngine {
     this.executionTimeoutMs = validateTimeout(options.executionTimeoutMs ?? EXECUTION_TIMEOUT_MS, EXECUTION_TIMEOUT_MS);
     this.packageLoadTimeoutMs = validateTimeout(options.packageLoadTimeoutMs ?? PACKAGE_LOAD_TIMEOUT_MS, PACKAGE_LOAD_TIMEOUT_MS);
     // Internal transport seam for deterministic lifecycle tests; production uses the sandbox adapter.
-    this.runtimeFactory = options.runtimeFactory || (callback => new PyodideRuntime(callback));
+    this.client = new WorkerClient(event => this._receive(event), options.runtimeFactory);
     this.status = 'idle';
     this.pythonVersion = '';
-    this.sequence = 0;
     this.generation = 0;
     this._clearPackages();
   }
@@ -47,19 +47,12 @@ export class PythonEngine {
     if (this.ready()) return Promise.resolve(this.getRuntimeInfo());
     if (this.initializer) return this.initializer.promise;
     if (this.active) return Promise.reject(this._error('BUSY'));
-    const generation = ++this.generation;
+    this.generation++;
     let resolve, reject;
     const promise = new Promise((accept, fail) => { resolve = accept; reject = fail; });
     this.initializer = { promise, resolve, reject };
     this._setStatus('initializing');
-    try {
-      this.runtime = this.runtimeFactory(message => {
-        if (generation === this.generation) this._receive(message);
-      });
-      Promise.resolve(this.runtime.initialize()).catch(error => {
-        if (generation === this.generation) this._fatal(error);
-      });
-    } catch (error) { this._fatal(error); }
+    this.client.initialize();
     return promise;
   }
 
@@ -74,7 +67,7 @@ export class PythonEngine {
     catch (error) { return Promise.reject(error); }
     return this._begin({ operation, request, stdout: '', stderr: '' },
       request.timeoutMs ?? this.executionTimeoutMs,
-      id => this.runtime.run(id, request.source, operation, request.filename));
+      (id, timeoutMs) => this.client.run(id, request, operation, timeoutMs));
   }
 
   loadPackages(packageIds) {
@@ -91,27 +84,16 @@ export class PythonEngine {
     });
     for (const id of pending) this.packageStates[id] = { status: 'loading', error: '' };
     return this._begin({ operation: 'load-packages', packageIds: ids }, this.packageLoadTimeoutMs,
-      id => this.runtime.loadPackages(id, pending));
+      (id, timeoutMs) => this.client.loadPackages(id, pending, timeoutMs));
   }
 
   _begin(fields, timeoutMs, dispatch) {
-    const id = ++this.sequence;
+    const id = this.client.allocateId();
     let resolve, reject;
     const promise = new Promise((accept, fail) => { resolve = accept; reject = fail; });
     this.active = { ...fields, id, resolve, reject };
     this._setStatus(OPERATION_STATUS[fields.operation] || 'loading-packages');
-    this.timer = setTimeout(() => {
-      if (this.active?.id !== id) return;
-      const error = new PythonEngineError('The Python operation exceeded its time limit. Reset or initialize the engine to continue.', 'TIMEOUT');
-      this._destroy(error, 'stopped');
-      this._emit('onError', error);
-    }, timeoutMs);
-    const generation = this.generation;
-    try {
-      Promise.resolve(dispatch(id)).catch(error => {
-        if (generation === this.generation && this.active?.id === id) this._fatal(error);
-      });
-    } catch (error) { this._fatal(error); }
+    dispatch(id, timeoutMs);
     return promise;
   }
 
@@ -154,22 +136,29 @@ export class PythonEngine {
       return;
     }
     if (message.type === 'fatal') {
-      this._fatal(new Error(typeof message.message === 'string' ? message.message.slice(0, 1000) : 'The Python runtime failed.'));
+      this._fatal(message.error);
+      return;
+    }
+    if (message.type === 'timeout') {
+      const error = new PythonEngineError('The Python operation exceeded its time limit. Reset or initialize the engine to continue.', 'TIMEOUT');
+      this._destroy(error, 'stopped');
+      this._emit('onError', error);
       return;
     }
     const active = this.active;
     if (!active || message.id !== active.id) return;
+    const payload = message.payload;
     if (message.type === 'stream' && active.operation === 'run') {
-      this._stream(message, active);
+      this._stream(payload, active);
     } else if (message.type === 'package-result' && active.operation === 'load-packages') {
-      const confirmed = new Set(Array.isArray(message.loadedPackageIds) ?
-        message.loadedPackageIds.filter(id => PACKAGE_BY_ID.has(id)) : []);
+      const confirmed = new Set(Array.isArray(payload.loadedPackageIds) ?
+        payload.loadedPackageIds.filter(id => PACKAGE_BY_ID.has(id)) : []);
       const packages = active.packageIds.map(id => {
-        const raw = Array.isArray(message.results) ? message.results.find(item => item?.id === id) : null;
+        const raw = Array.isArray(payload.results) ? payload.results.find(item => item?.id === id) : null;
         const loaded = raw?.loaded === true || this.packageStates[id].status === 'loaded';
         if (loaded) confirmed.add(id);
         const error = typeof raw?.error === 'string' ? raw.error.slice(0, 500) :
-          typeof message.error === 'string' ? message.error.slice(0, 500) : 'The runtime did not confirm that the package loaded.';
+          typeof payload.error === 'string' ? payload.error.slice(0, 500) : 'The runtime did not confirm that the package loaded.';
         this.packageStates[id] = loaded ? { status: 'loaded', error: '' } : { status: 'error', error };
         return { id, loaded, ...(loaded ? {} : { error }) };
       });
@@ -182,11 +171,11 @@ export class PythonEngine {
         packages, loadedPackages: this._loadedPackages() };
       this._finish(active, result, 'onPackages');
     } else if (message.type === 'result' && active.operation !== 'load-packages') {
-      const result = createEngineResult(message, {
+      const result = createEngineResult(payload, {
         operation: active.operation, filename: active.request.filename, pythonVersion: this.pythonVersion,
         requestId: active.id, generation: this.generation,
       });
-      if (active.operation === 'run') this._stream(message, active);
+      if (active.operation === 'run') this._stream(payload, active);
       this._finish(active, result, 'onResult');
     }
   }
@@ -204,8 +193,6 @@ export class PythonEngine {
   }
 
   _finish(active, result, callback) {
-    clearTimeout(this.timer);
-    this.timer = null;
     this.active = null;
     this._setStatus('ready');
     this._emit(callback, result, true);
@@ -220,13 +207,10 @@ export class PythonEngine {
 
   _destroy(error, status) {
     this.generation++;
-    clearTimeout(this.timer);
-    this.timer = null;
     const active = this.active, initializer = this.initializer;
     this.active = null;
     this.initializer = null;
-    this.runtime?.dispose();
-    this.runtime = null;
+    this.client.stop();
     this.pythonVersion = '';
     this._clearPackages();
     this._setStatus(status);

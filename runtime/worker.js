@@ -105,10 +105,10 @@
       finally { busy = false; }
       return;
     }
-    const operations = ['run', 'compile', 'inspect', 'diagnose'];
-    if (data.type !== 'run' || busy || !execute || !Number.isSafeInteger(data.id) ||
+    const analysisOperations = ['compile', 'inspect', 'diagnose'];
+    if (!['run', 'analysis'].includes(data.type) || busy || !execute || !Number.isSafeInteger(data.id) ||
         typeof data.source !== 'string' || data.source.length > 100000 ||
-        !operations.includes(data.operation || 'run') || typeof data.filename !== 'string' ||
+        (data.type === 'analysis' && !analysisOperations.includes(data.operation)) || typeof data.filename !== 'string' ||
         !data.filename || data.filename.length > 240 || /[\x00-\x1f\x7f]/.test(data.filename)) return;
     busy = true;
     runId = data.id;
@@ -117,7 +117,7 @@
     const started = performance.now();
     try {
       let result;
-      if ((data.operation || 'run') === 'run') {
+      if (data.type === 'run') {
         result = JSON.parse(execute(data.source, data.filename));
       } else {
         if (!inspect) {
@@ -127,7 +127,8 @@
         }
         result = JSON.parse(inspect(data.source, data.filename));
       }
-      send({ type: 'result', id: runId, ...result, stdout, stderr, truncated, duration: performance.now() - started });
+      send({ type: 'result', id: runId, operation: data.type === 'run' ? 'run' : data.operation,
+        ...result, stdout, stderr, truncated, duration: performance.now() - started });
     } catch (error) {
       send({ type: 'fatal', message: `The Python runtime needs to restart. ${cleanError(error)}` });
     } finally { busy = false; runId = 0; }
