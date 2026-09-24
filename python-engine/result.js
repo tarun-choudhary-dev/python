@@ -109,6 +109,28 @@ function diagnosticsFor(result, operation) {
 }
 
 export function createEngineResult(message, { operation, filename, pythonVersion, requestId, generation }) {
+  if (operation === 'run') {
+    const value = validateOutput(message);
+    const error = safeText(message?.error) || null;
+    const errorLine = Math.max(0, safeInteger(message?.errorLine));
+    const kind = message?.errorKind === 'syntax' ? 'syntax' : 'runtime';
+    return {
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      requestId, generation, operation,
+      status: error ? 'failed' : 'completed',
+      exitCode: error ? 1 : 0,
+      filename,
+      stdout: value.stdout,
+      stderr: value.stderr,
+      error,
+      errorLine,
+      durationMs: Number.isFinite(message?.duration) ? Math.max(0, message.duration) : 0,
+      outputTruncated: value.outputTruncated,
+      pythonVersion,
+      runtime: { name: 'Pyodide', version: PYODIDE_VERSION, pythonVersion },
+      diagnostics: error ? [{ kind, severity: 'error', message: kind === 'syntax' ? safeText(message?.diagnostic) || error : error, line: errorLine }] : [],
+    };
+  }
   const value = processWorkerResult(message);
   const error = value.error || value.compileError || value.astError || value.tokenError || null;
   return {

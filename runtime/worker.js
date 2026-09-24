@@ -2,7 +2,7 @@
 (() => {
   'use strict';
   const send = globalThis.postMessage.bind(globalThis);
-  let pyodide, execute, responses, packageCatalog = [], busy = false, runId = 0, maxOutput = 100000;
+  let pyodide, execute, inspect, responses, packageCatalog = [], busy = false, runId = 0, maxOutput = 100000;
   let stdout = '', stderr = '', truncated = false, lastStream = 0;
   const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
   const cleanError = error => error instanceof Error ? error.message : 'An unexpected Python runtime error occurred.';
@@ -27,7 +27,7 @@
   }
 
   async function initialize(data) {
-    const { files, inspector } = data.assets;
+    const { files, executor } = data.assets;
     maxOutput = data.maxOutput;
     packageCatalog = Array.isArray(data.packageCatalog) ? data.packageCatalog : [];
     // Pyodide's loader sees fixed in-memory assets, never the actual fetch API.
@@ -53,7 +53,7 @@
     } finally { urls.forEach(url => URL.revokeObjectURL(url)); }
     pyodide.setStdout({ write: bytes => capture('stdout', bytes) });
     pyodide.setStderr({ write: bytes => capture('stderr', bytes) });
-    pyodide.runPython(inspector);
+    pyodide.runPython(executor);
     execute = pyodide.globals.get('_pylab_execute');
     const version = pyodide.runPython("'.'.join(map(str, __import__('sys').version_info[:3]))");
     // Remove the convenient public JS runtime bridge. Empty `js` exposes no APIs.
@@ -116,7 +116,17 @@
     decoders.stdout = new TextDecoder(); decoders.stderr = new TextDecoder();
     const started = performance.now();
     try {
-      const result = JSON.parse(execute(data.source, data.operation || 'run', data.filename));
+      let result;
+      if ((data.operation || 'run') === 'run') {
+        result = JSON.parse(execute(data.source, data.filename));
+      } else {
+        if (!inspect) {
+          if (typeof data.inspector !== 'string') throw new Error('The inspection source is unavailable.');
+          pyodide.runPython(data.inspector);
+          inspect = pyodide.globals.get('_pylab_inspect');
+        }
+        result = JSON.parse(inspect(data.source, data.filename));
+      }
       send({ type: 'result', id: runId, ...result, stdout, stderr, truncated, duration: performance.now() - started });
     } catch (error) {
       send({ type: 'fatal', message: `The Python runtime needs to restart. ${cleanError(error)}` });

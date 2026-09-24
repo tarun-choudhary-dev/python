@@ -37,12 +37,7 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
 
     let result = await run('print("hello")');
     assert(result.stdout === 'hello\n' && result.status === 'completed' && result.exitCode === 0, 'run returns captured output and completion status');
-    assert(result.inspection.tokens.some(token => token.value === 'print') &&
-      result.inspection.ast.nodes.some(node => node.type === 'Call') &&
-      result.inspection.codeObjects[0].name === '<module>' &&
-      result.inspection.instructions.some(item => item.opcode === 'CALL') &&
-      result.inspection.bytecode.includes('Bytecode bytes') &&
-      result.inspection.disassembly.includes('LOAD_CONST'), 'public result contains real compiler artifacts');
+    assert(!Object.hasOwn(result, 'inspection'), 'run result contains no compiler inspection artifacts');
     assert(JSON.stringify(JSON.parse(JSON.stringify(result))) === JSON.stringify(result), 'result is JSON serializable');
     result = await run('print("α🙂", end="")');
     assert(result.stdout === 'α🙂', 'Unicode and output without trailing newline');
@@ -54,7 +49,7 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
       'runtime exceptions preserve output and synthetic source location');
     result = await run('def :');
     assert(result.status === 'failed' && result.diagnostics.some(item => item.kind === 'syntax') &&
-      result.errorLine === 1 && !result.inspection.bytecode, 'syntax errors do not retain older compiled artifacts');
+      result.errorLine === 1 && !Object.hasOwn(result, 'inspection'), 'syntax errors do not produce inspection artifacts');
     await rejects(engine.run('  \n'), 'EMPTY_SOURCE');
     assert(engine.ready(), 'invalid input does not destroy the runtime');
 
@@ -82,7 +77,8 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
       result.inspection.tokensTruncated, 'inspection artifacts remain bounded');
     await run('temporary_name = 99');
     result = await run('print(temporary_name)');
-    assert(result.error.includes('NameError'), 'each run has fresh user globals');
+    assert(result.error.includes('NameError') && !Object.hasOwn(result, 'inspection'),
+      'each run has fresh user globals and remains inspection-free after analysis');
     result = await run('print("x" * 200000)');
     assert(result.stdout.length + result.stderr.length <= 100000 && result.outputTruncated, 'execution output stays within shared limit');
 

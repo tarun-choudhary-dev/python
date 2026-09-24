@@ -20,7 +20,9 @@
         worker.onerror = () => port.postMessage({ type: 'fatal', message: 'The Python worker stopped unexpectedly. Retry to start a fresh runtime.' });
         worker.postMessage({ type: 'init', assets: data.assets, maxOutput: data.maxOutput, packageCatalog: data.packageCatalog });
       } else if (data.type === 'run' && worker) {
-        worker.postMessage({ type: 'run', id: data.id, source: data.source, operation: data.operation, filename: data.filename });
+        const request = { type: 'run', id: data.id, source: data.source, operation: data.operation, filename: data.filename };
+        if (data.operation !== 'run') request.inspector = data.inspector;
+        worker.postMessage(request);
       } else if (data.type === 'load-packages' && worker) {
         worker.postMessage({ type: 'load-packages', id: data.id, packages: data.packages, errors: data.errors, files: data.files });
       } else if (data.type === 'stop') {

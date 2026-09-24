@@ -30,7 +30,7 @@ Each instance owns one interpreter. Independent instances have separate interpre
 | `ready()` | boolean | True only when initialization has finished and no operation is active. |
 | `getState()` | serializable state | Current status, ready flag, Python version, operation/request identity, generation and loaded package IDs. |
 | `getRuntimeInfo()` | serializable metadata | Runtime name, Pyodide version, Python version and status. |
-| `run(input, options?)` | `Promise<Result>` | Tokenize, parse, compile, inspect, then execute Python. |
+| `run(input, options?)` | `Promise<Result>` | Compile and execute Python directly, capturing output and errors without inspection artifacts. |
 | `compile(input, options?)` | `Promise<Result>` | Run the real CPython compilation/inspection pipeline, without execution. |
 | `inspect(input, options?)` | `Promise<Result>` | Return the same compiler artifacts without execution. |
 | `diagnose(input, options?)` | `Promise<Result>` | Return tokenizer/parser/compiler diagnostics and available artifacts without execution. |
@@ -59,7 +59,7 @@ The object form supplies all request fields; a second options object is used onl
 
 ## Result
 
-All four source operations resolve to this JSON-serializable shape:
+All four source operations resolve to this JSON-serializable base shape:
 
 ~~~js
 {
@@ -81,7 +81,13 @@ All four source operations resolve to this JSON-serializable shape:
   diagnostics: [
     // { kind: 'syntax', severity: 'error', message: '...', line: 1 }
   ],
-  inspection: {
+}
+~~~
+
+Only `compile`, `inspect` and `diagnose` results also contain this optional analysis field:
+
+~~~js
+inspection: {
     tokens: [],
     tokensTruncated: false,
     tokenError: null,
@@ -93,13 +99,12 @@ All four source operations resolve to this JSON-serializable shape:
     bytecode: '',
     disassembly: '',
     compileError: null,
-  },
 }
 ~~~
 
-`exitCode` is the engine's success/failure indicator, not an OS process exit code; Python `SystemExit` is captured as an exception. Python exceptions resolve a failed result so completed output and artifacts remain available. They do not reject the promise. `stderr` alone does not indicate failure.
+`run` results omit `inspection` entirely. Call `inspect`, `compile` or `diagnose` separately to request artifacts. `exitCode` is the engine's success/failure indicator, not an OS process exit code; Python `SystemExit` is captured as an exception. Python exceptions resolve a failed result so completed output remains available. They do not reject the promise. `stderr` alone does not indicate failure.
 
-Diagnostic kinds are `tokenization`, `syntax`, `compilation` and `runtime`. They contain available one-based lines, not guessed columns; `0` means no line was available. Parse failure yields a syntax diagnostic, while a valid AST rejected by `compile` yields a compilation diagnostic. Runtime errors appear only for `run`.
+Diagnostic kinds are `tokenization`, `syntax`, `compilation` and `runtime`. They contain available one-based lines, not guessed columns; `0` means no line was available. Analysis parse failure yields a syntax diagnostic, while a valid AST rejected by `compile` yields a compilation diagnostic. `run` reports syntax or runtime errors directly from CPython execution; runtime errors appear only for `run`.
 
 Artifacts are plain data, never live Python handles, host objects, DOM nodes or rendered HTML. `ast.tree`, `ast.dump`, `bytecode` and `disassembly` are text. AST node/parent/child records, code-object metadata and instruction records are structured as emitted by CPython and validated by the engine.
 

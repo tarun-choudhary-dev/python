@@ -61,10 +61,12 @@ Consumer application / future IDE
               |
         Pyodide 0.29.3
               |
-      CPython + inspector.py
+      CPython + executor.py
+          | optional analysis
+        inspector.py
 ~~~
 
-`run`, `compile`, `inspect` and `diagnose` use the same CPython pipeline. Only `run` calls `exec`. Compilation returns serializable metadata, not a live code object, executable handle or transferable CPython bytecode format. Inspection locations are authentic CPython positions.
+`run` compiles and executes directly through `executor.py`; it does not load or produce tokens, AST, code-object metadata, bytecode or disassembly. `compile`, `inspect` and `diagnose` load `inspector.py` on demand and never execute source. Compilation returns serializable metadata, not a live code object, executable handle or transferable CPython bytecode format. Inspection locations are authentic CPython positions.
 
 There is one runtime implementation. The engine and runtime modules separate lifecycle/data validation from browser isolation and CPython execution. They have no dependency on the removed PYLAB application.
 
@@ -83,7 +85,8 @@ runtime/
   runtime.js               Opaque iframe and MessageChannel adapter
   sandbox.html             Restrictive CSP and worker termination
   worker.js                Pyodide operations and streaming
-  inspector.py             Real CPython compiler/inspection pipeline
+  executor.py              Direct CPython execution and errors
+  inspector.py             Optional CPython compiler inspection
 scripts/                   Static asset server and distribution build
 tests/                     Unit and real browser/runtime tests
 ~~~
@@ -151,7 +154,7 @@ npm run test:runtime -- --built
 
 `test:runtime` starts a temporary static server and headless Chromium and exercises the real opaque iframe, worker and CPython. With `--built`, its public API tests import `dist/index.js`; without it, they import the source entry. Set `CHROME_PATH` if Chrome/Edge is not in a detected location. Runtime/package download access is required. It retains the existing runtime regression suite and adds public engine API tests; UI-specific tests were removed along with the UI.
 
-`build` recreates the generated `dist/` directory with the root entry, engine modules, runtime assets and documentation. It deliberately has no `index.html`. Mount these assets in the consumer application and import `index.js`. Keep companion assets beside the modules; bundlers must copy the worker, inspector and sandbox without changing their relative URLs.
+`build` recreates the generated `dist/` directory with the root entry, engine modules, runtime assets and documentation. It deliberately has no `index.html`. Mount these assets in the consumer application and import `index.js`. Keep companion assets beside the modules; bundlers must copy the worker, executor, optional inspector and sandbox without changing their relative URLs.
 
 `npm run dev` serves source assets on `http://127.0.0.1:4173/index.js`. The blank `tests/harness.html` is only a browser test fixture. CI runs tests and builds the engine; the former automatic application deployment is removed.
 

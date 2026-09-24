@@ -1,4 +1,4 @@
-import { loadPackageAssets, loadRuntimeAssets } from './assets.js';
+import { loadInspectorSource, loadPackageAssets, loadRuntimeAssets } from './assets.js';
 import { LOAD_TIMEOUT_MS, MAX_OUTPUT_CHARS } from './config.js';
 import { PYTHON_PACKAGES } from './packages.js';
 
@@ -36,8 +36,15 @@ export class PyodideRuntime {
       if (generation === this.generation) this.fail(error instanceof Error ? error.message : 'Python could not load. Check your connection and retry.');
     }
   }
-  run(id, source, operation = 'run', filename = 'main.py') {
-    this.port.postMessage({ type: 'run', id, source, operation, filename });
+  async run(id, source, operation = 'run', filename = 'main.py') {
+    if (operation === 'run') {
+      this.port.postMessage({ type: 'run', id, source, operation, filename });
+      return;
+    }
+    const generation = this.generation;
+    const inspector = await loadInspectorSource();
+    if (generation !== this.generation || !this.port) return;
+    this.port.postMessage({ type: 'run', id, source, operation, filename, inspector });
   }
   async loadPackages(id, packageIds) {
     const generation = this.generation;

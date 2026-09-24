@@ -2,6 +2,7 @@ import { RUNTIME_BASE, RUNTIME_FILES, LOAD_TIMEOUT_MS, PYODIDE_VERSION } from '.
 import { PACKAGE_BY_ID } from './packages.js';
 
 let pending;
+let pendingInspector;
 const packageDownloads = new Map();
 /** Cache immutable runtime assets across Stop/retry, without caching a failed download. */
 export function loadRuntimeAssets() {
@@ -16,15 +17,31 @@ export function loadRuntimeAssets() {
       return binary ? response.arrayBuffer() : response.text();
     }
     try {
-      const [files, workerSource, inspector] = await Promise.all([
+      const [files, workerSource, executor] = await Promise.all([
         Promise.all(RUNTIME_FILES.map(async name => [name, await read(new URL(name, RUNTIME_BASE).href, true)])),
         read(new URL('./worker.js', import.meta.url).href),
-        read(new URL('./inspector.py', import.meta.url).href),
+        read(new URL('./executor.py', import.meta.url).href),
       ]);
-      return { files: Object.fromEntries(files), workerSource, inspector };
+      return { files: Object.fromEntries(files), workerSource, executor };
     } finally { clearTimeout(timer); }
   })().catch(error => { pending = null; throw error; });
   return pending;
+}
+
+/** Compiler inspection is fetched only for an explicit analysis request. */
+export function loadInspectorSource() {
+  if (pendingInspector) return pendingInspector;
+  pendingInspector = (async () => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), LOAD_TIMEOUT_MS);
+    try {
+      const response = await fetch(new URL('./inspector.py', import.meta.url).href,
+        { signal: abort.signal, credentials: 'same-origin', referrerPolicy: 'no-referrer' });
+      if (!response.ok) throw new Error(`Could not download inspector.py (HTTP ${response.status}).`);
+      return response.text();
+    } finally { clearTimeout(timer); }
+  })().catch(error => { pendingInspector = null; throw error; });
+  return pendingInspector;
 }
 
 function packageLock(assets) {

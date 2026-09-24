@@ -1,4 +1,4 @@
-"""Compile, inspect, and execute in CPython. Only JSON crosses the engine boundary."""
+"""Optional CPython compiler inspection. Only JSON crosses the engine boundary."""
 import ast
 import dis
 import io
@@ -11,9 +11,9 @@ import traceback
 import types
 
 
-def _pylab_make_runner():
+def _pylab_make_inspector():
     # Capture helpers so user globals cannot accidentally overwrite the runner.
-    compile_source, execute, encode = compile, exec, json.dumps
+    compile_source, encode = compile, json.dumps
     disassemble, instructions, code_type = dis.dis, dis.get_instructions, types.CodeType
     original_stdout, original_stderr = sys.stdout, sys.stderr
     original_stdin = sys.stdin
@@ -226,7 +226,7 @@ def _pylab_make_runner():
         visit(root)
         return text.getvalue()
 
-    def operate(source, operation="run", filename="main.py"):
+    def operate(source, filename="main.py"):
         result = {
             "tokens": [], "tokenError": "", "tokensTruncated": False,
             "astTree": "", "astDump": "", "astError": "", "compileError": "",
@@ -256,9 +256,6 @@ def _pylab_make_runner():
             listing = LimitedText()
             disassemble(code, file=listing, depth=12, show_caches=False, adaptive=False)
             result['disassembly'] = listing.getvalue()
-            if operation == "run":
-                namespace = {'__name__': '__main__', '__file__': filename, '__builtins__': __builtins__}
-                execute(code, namespace, namespace)
         except BaseException as error:
             if isinstance(error, SyntaxError) and not result['compileError']:
                 result['compileError'] = f"SYNTAX ERROR\n{error.__class__.__name__}: {error.msg} (line {error.lineno or '?'})\nNo code object or bytecode was produced."
@@ -288,4 +285,4 @@ def _pylab_make_runner():
     return operate
 
 
-_pylab_execute = _pylab_make_runner()
+_pylab_inspect = _pylab_make_inspector()

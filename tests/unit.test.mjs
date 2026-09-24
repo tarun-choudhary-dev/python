@@ -319,11 +319,10 @@ test('worker validation bounds all artifact collections and strips unexpected fi
   assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
 });
 
-test('diagnostics separate syntax, compilation and runtime errors with source lines', () => {
+test('run diagnostics distinguish syntax and runtime errors without inspection', () => {
   const context = { operation: 'run', filename: 'main.py', pythonVersion: '3.13.2', requestId: 1, generation: 1 };
   for (const [fields, kind] of [
-    [{ error: 'SyntaxError', astError: 'syntax', compileError: 'syntax, no bytecode' }, 'syntax'],
-    [{ error: 'SyntaxError', compileError: 'top-level return' }, 'compilation'],
+    [{ error: 'SyntaxError', errorKind: 'syntax', diagnostic: 'syntax' }, 'syntax'],
     [{ error: 'NameError' }, 'runtime'],
   ]) {
     const result = createEngineResult({ ...fields, errorLine: 2 }, context);
@@ -332,7 +331,11 @@ test('diagnostics separate syntax, compilation and runtime errors with source li
     assert.equal(result.diagnostics.length, 1);
     assert.equal(result.diagnostics[0].kind, kind);
     assert.equal(result.diagnostics[0].line, 2);
+    assert.equal(Object.hasOwn(result, 'inspection'), false);
   }
+  const compilation = createEngineResult({ error: 'SyntaxError', compileError: 'top-level return', errorLine: 2 },
+    { ...context, operation: 'diagnose' });
+  assert.equal(compilation.diagnostics[0].kind, 'compilation');
   assert.equal(JSON.parse(JSON.stringify(new PythonEngineError('cancelled', 'CANCELLED'))).code, 'CANCELLED');
 });
 
