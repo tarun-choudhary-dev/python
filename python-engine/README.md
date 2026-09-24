@@ -26,8 +26,10 @@ Each instance owns one interpreter. Independent instances have separate interpre
 
 | Method | Return | Behavior |
 | --- | --- | --- |
-| `initialize()` | `Promise<RuntimeInfo>` | Load the pinned interpreter. Concurrent initialization shares a promise. Resolves immediately if ready. Rejects `BUSY` during another operation. |
+| `initialize()` | `Promise<RuntimeInfo>` | Load the pinned interpreter. Concurrent initialization or recovery shares a promise. Resolves immediately if ready. Rejects `BUSY` during another operation. |
 | `ready()` | boolean | True only when initialization has finished and no operation is active. |
+| `isReady()` | boolean | Alias for `ready()`. |
+| `isBusy()` | boolean | True while a source or package operation is active. |
 | `getState()` | serializable state | Current status, ready flag, Python version, operation/request identity, generation and loaded package IDs. |
 | `getRuntimeInfo()` | serializable metadata | Runtime name, Pyodide version, Python version and status. |
 | `run(input, options?)` | `Promise<Result>` | Compile and execute Python directly, capturing output and errors without inspection artifacts. |
@@ -37,7 +39,8 @@ Each instance owns one interpreter. Independent instances have separate interpre
 | `getAvailablePackages()` | array | Nine curated records with `id`, `label`, `runtimeName`, `importName`, `status`, `error`. |
 | `loadPackages(ids)` | `Promise<PackageResult>` | Load curated IDs and their dependencies. Confirm imports. Does not run caller source. |
 | `stop()` | boolean | Terminate the interpreter and reject pending work with `CANCELLED`. Returns whether work/initialization was active. Also releases a ready interpreter. |
-| `reset()` | `Promise<RuntimeInfo>` | Reject pending work with `RESET`, destroy the interpreter, then initialize a fresh one. |
+| `cancel()` | `Promise<RuntimeInfo \| null>` | Reject active work with `CANCELLED`, terminate its sandbox and resolve after a fresh runtime is ready. Ready is a no-op; idle resolves `null`. |
+| `reset()` | `Promise<RuntimeInfo>` | Reject pending work with `RESET`, destroy the interpreter, then initialize a fresh one. Concurrent replacement calls share a promise. |
 | `dispose()` | void | Terminal cleanup. Reject pending work with `DISPOSED`. Safe to call repeatedly. |
 
 `compile`, `inspect` and `diagnose` intentionally share the existing complete compiler pipeline. No fabricated AST, disassembly or bytecode is returned. `diagnose` does not attempt semantic inference or execute code to detect runtime errors; runtime errors appear in `run` results.
@@ -133,14 +136,16 @@ Callbacks run as microtasks after internal state transitions; exceptions thrown 
 ~~~text
 idle → initializing → ready
 ready → running / compiling / inspecting / diagnosing / loading-packages → ready
-any live state → stopped       (Stop or timeout)
-any live state → unavailable   (fatal runtime failure)
+active → initializing → ready  (cancel, timeout or recoverable Worker failure)
+initializing → idle            (retryable initialization failure)
+initializing → unavailable     (replacement failure)
+any live state → stopped       (legacy stop())
 any state → disposed          (terminal)
 
 stopped/unavailable → initializing → ready
 ~~~
 
-A status callback is a historical transition snapshot; use `getState()` when current state is needed.
+A status callback is a transition snapshot from the current runtime generation; queued notifications from a discarded generation are dropped. Use `getState()` when current state is needed.
 
 `onError` reports infrastructure failures and timeouts. Validation, `BUSY`, cancellation, reset and disposal are reported by the operation's rejected promise instead.
 
@@ -154,12 +159,11 @@ const outcome = pending.catch(error => {
   if (error.code !== 'CANCELLED') throw error;
   return null;
 });
-python.stop();
+await python.cancel(); // terminates the old Worker and starts a fresh runtime
 await outcome;
-await python.reset();
 ~~~
 
-Stop/timeout/fatal failure destroys the interpreter and its package state. Timeout leaves status `stopped`; call `initialize()` or `reset()` explicitly to continue. Packages are not reloaded automatically. `dispose()` is terminal: create a new instance to use Python again.
+`stop()` retains its synchronous legacy behavior and leaves the engine stopped until `initialize()` or `reset()`. Cancellation and operation timeout destroy the interpreter and package state, then start a fresh runtime; `initialize()` can await an in-progress replacement. An active Worker failure rejects the operation and also starts replacement. Initial startup failures leave the engine idle for retry; failed replacement leaves it unavailable until an explicit `initialize()` or `reset()` retry. Packages are not reloaded automatically. `dispose()` is terminal: create a new instance to use Python again.
 
 Each rejected promise uses `PythonEngineError` with `name`, `message`, `code` and optional serializable `details`. `JSON.stringify(error)` is supported.
 
@@ -168,10 +172,10 @@ Each rejected promise uses `PythonEngineError` with `name`, `message`, `code` an
 | `INVALID_REQUEST`, `INVALID_SOURCE`, `EMPTY_SOURCE`, `SOURCE_TOO_LARGE`, `INVALID_FILENAME`, `INVALID_TIMEOUT` | Invalid source-operation input |
 | `INVALID_OPTIONS` | Invalid construction callbacks/options |
 | `INVALID_PACKAGES` | Empty, malformed, unknown or non-curated package request |
-| `NOT_READY`, `BUSY` | Lifecycle precondition failed |
+| `NOT_READY`, `BUSY`, `INVALID_STATE` | Lifecycle precondition failed |
 | `CANCELLED`, `RESET`, `DISPOSED` | Caller terminated the pending operation |
-| `TIMEOUT` | Watchdog terminated the interpreter |
-| `RUNTIME_FAILURE` | Runtime initialization, worker or transport failure |
+| `TIMEOUT` | Initialization or operation deadline; active operations start replacement |
+| `RUNTIME_FAILURE` | Runtime initialization, worker or transport failure; active failures start replacement |
 
 Runtime generations and monotonically increasing request IDs reject stale messages. Callers still own source revision tracking: compare the request/source revision with the current editor before displaying a result.
 

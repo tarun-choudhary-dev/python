@@ -18,6 +18,7 @@
         URL.revokeObjectURL(url);
         worker.onmessage = event => port.postMessage(event.data);
         worker.onerror = () => port.postMessage({ type: 'fatal', message: 'The Python worker stopped unexpectedly. Retry to start a fresh runtime.' });
+        worker.onmessageerror = () => port.postMessage({ type: 'fatal', message: 'The Python worker sent an unreadable response.' });
         worker.postMessage({ type: 'init', assets: data.assets, maxOutput: data.maxOutput, packageCatalog: data.packageCatalog });
       } else if ((data.type === 'run' || data.type === 'analysis') && worker) {
         const request = { type: data.type, id: data.id, source: data.source, filename: data.filename };

@@ -129,7 +129,7 @@ The catalog is exactly:
 
 The host downloads only selected packages' archives and dependencies from the pinned Pyodide lockfile. The worker uses Pyodide's package loader against a fixed in-memory asset map, then verifies Python imports. No arbitrary package, URL, PyPI or pip API is exposed. Matplotlib can perform noninteractive operations; the engine does not provide a plot renderer or image-display bridge.
 
-Packages persist between normal operations. Stop, timeout, reset, disposal and fatal failure destroy the interpreter and clear package state. Initialization does not automatically reload packages. Source changes are the caller's concern and do not unload packages.
+Packages persist between normal operations. Stop, cancellation, timeout, reset, disposal and Worker failure destroy the interpreter and clear package state. Cancellation, operation timeout and recoverable Worker failure start a fresh runtime; initialization does not automatically reload packages. Source changes are the caller's concern and do not unload packages.
 
 ## Security and limits
 

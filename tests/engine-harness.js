@@ -110,12 +110,17 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
     assert(result.stdout === 'x + 1\n' && !result.error, 'SymPy integration works with its dependency');
     await rejects(engine.loadPackages(['requests']), 'INVALID_PACKAGES');
 
+    result = await run('import builtins, sys\nbuiltins._pylab_phase5 = 123\nsys._pylab_phase5 = 456\nopen("/tmp/pylab-phase5.txt", "w").write("saved")');
+    assert(result.status === 'completed', 'interpreter mutations and virtual files can exist before reset');
+
     const beforeResetGeneration = engine.getState().generation;
     await engine.reset();
     assert(engine.ready() && engine.getState().generation > beforeResetGeneration &&
       engine.getAvailablePackages().every(item => item.status === 'unloaded'), 'reset changes generation and unloads packages');
     result = await run('import numpy');
     assert(result.error?.includes('ModuleNotFoundError'), 'reset destroys the loaded interpreter');
+    result = await run('import builtins, sys, os\nprint(hasattr(builtins, "_pylab_phase5"), hasattr(sys, "_pylab_phase5"), os.path.exists("/tmp/pylab-phase5.txt"))');
+    assert(result.stdout === 'False False False\n', 'reset clears builtins, module changes and virtual files');
     const loading = engine.loadPackages(['pandas']);
     const loadingCancelled = rejects(loading, 'CANCELLED');
     engine.stop();
@@ -133,8 +138,24 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
     result = await run('print("after stop")');
     assert(result.stdout === 'after stop\n', 'execution recovers after Stop and reset');
 
+    const cancelledFrame = document.querySelector('iframe');
+    const endless = engine.run('while True:\n    pass');
+    const cancelledRun = rejects(endless, 'CANCELLED');
+    await new Promise(resolve => setTimeout(resolve, 120));
+    const cancelledRecovery = engine.cancel();
+    await cancelledRun;
+    assert(!cancelledFrame.isConnected && engine.getState().status === 'initializing',
+      'cancel terminates the old sandbox and starts recovery');
+    await cancelledRecovery;
+    assert(engine.ready() && document.querySelector('iframe') !== cancelledFrame,
+      'cancel creates a fresh opaque sandbox');
+    result = await run('print("after cancel")');
+    assert(result.stdout === 'after cancel\n', 'run succeeds after cancellation recovery');
+
+    const timedOutFrame = document.querySelector('iframe');
     await rejects(engine.run('while True:\n    pass', { timeoutMs: 100 }), 'TIMEOUT');
-    assert(engine.getState().status === 'stopped' && !document.querySelector('iframe'), 'timeout terminates the sandbox');
+    assert(engine.getState().status === 'initializing' && !timedOutFrame.isConnected,
+      'timeout terminates the old sandbox and starts recovery');
     await engine.initialize();
     result = await run('print("after timeout")');
     assert(result.stdout === 'after timeout\n', 'execution recovers after timeout');

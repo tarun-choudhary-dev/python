@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { createPythonEngine, ENGINE_CAPABILITIES, ENGINE_PROTOCOL_VERSION, PythonEngineError } from '../index.js';
 import { createEngineResult, processWorkerResult, validateOutput } from '../python-engine/result.js';
+import { WorkerClient } from '../python-engine/worker-client.js';
 import { PYTHON_PACKAGES } from '../runtime/packages.js';
 import { resolvePackageArchives } from '../runtime/assets.js';
 
@@ -86,7 +87,7 @@ test('initialization failure is retryable and malformed versions fail closed', a
   const first = engine.initialize();
   transports[0].emit({ type: 'fatal', message: 'offline' });
   await assert.rejects(first, { code: 'RUNTIME_FAILURE', message: 'offline' });
-  assert.equal(engine.getState().status, 'unavailable');
+  assert.equal(engine.getState().status, 'idle');
   const retry = engine.initialize();
   transports[1].emit({ type: 'ready', version: '<script>' });
   await assert.rejects(retry, { code: 'RUNTIME_FAILURE' });
@@ -131,6 +132,8 @@ test('busy engines reject duplicate operations and initialize cannot restart an 
   const pending = engine.run('pass');
   await assert.rejects(engine.run('pass'), { code: 'BUSY' });
   await assert.rejects(engine.compile('pass'), { code: 'BUSY' });
+  await assert.rejects(engine.inspect('pass'), { code: 'BUSY' });
+  await assert.rejects(engine.diagnose('pass'), { code: 'BUSY' });
   await assert.rejects(engine.loadPackages(['numpy']), { code: 'BUSY' });
   await assert.rejects(engine.initialize(), { code: 'BUSY' });
   assert.equal(calls.filter(call => call[0] === 'initialize').length, 1);
@@ -214,11 +217,11 @@ test('reset cancels running work and does not accept an old result', async t => 
   assert.equal(engine.ready(), true);
 });
 
-test('execution timeout terminates runtime and requires explicit reinitialization', async t => {
+test('execution timeout terminates runtime and starts fresh recovery', async t => {
   const errors = [];
   const { engine, transports } = await initialized(t, { onError: error => errors.push(error.code) });
   await assert.rejects(engine.run('while True: pass', { timeoutMs: 5 }), { code: 'TIMEOUT' });
-  assert.equal(engine.getState().status, 'stopped');
+  assert.equal(engine.getState().status, 'initializing');
   assert.equal(transports[0].disposed, 1);
   assert.deepEqual(errors, ['TIMEOUT']);
   await assert.rejects(engine.run('pass'), { code: 'NOT_READY' });
@@ -227,7 +230,7 @@ test('execution timeout terminates runtime and requires explicit reinitializatio
   await loading;
 });
 
-test('fatal failures clear loaded packages and reject active work', async t => {
+test('worker failures clear packages, reject active work, and recover', async t => {
   const { engine, transports } = await initialized(t);
   const packages = engine.loadPackages(['numpy']);
   transports[0].emit({ type: 'package-result', id: engine.getState().requestId, results: [{ id: 'numpy', loaded: true }] });
@@ -236,7 +239,11 @@ test('fatal failures clear loaded packages and reject active work', async t => {
   transports[0].emit({ type: 'fatal', message: 'worker crashed' });
   await assert.rejects(pending, { code: 'RUNTIME_FAILURE' });
   assert.deepEqual(engine.getState().loadedPackages, []);
-  assert.equal(engine.getState().status, 'unavailable');
+  assert.equal(engine.getState().status, 'initializing');
+  const recovery = engine.initialize();
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  assert.equal(engine.ready(), true);
 });
 
 test('multiple packages expose loading, loaded and failed states without running source', async t => {
@@ -339,7 +346,7 @@ test('run diagnostics distinguish syntax and runtime errors without inspection',
   assert.equal(JSON.parse(JSON.stringify(new PythonEngineError('cancelled', 'CANCELLED'))).code, 'CANCELLED');
 });
 
-test('synchronous and asynchronous transport failures reject and invalidate runtime', async t => {
+test('synchronous and asynchronous transport failures reject and replace runtime', async t => {
   for (const asynchronous of [false, true]) {
     const { engine, transports } = await initialized(t);
     transports[0].run = () => {
@@ -347,7 +354,10 @@ test('synchronous and asynchronous transport failures reject and invalidate runt
       throw new Error('transport failed');
     };
     await assert.rejects(engine.run('pass'), { code: 'RUNTIME_FAILURE' });
-    assert.equal(engine.getState().status, 'unavailable');
+    assert.equal(engine.getState().status, 'initializing');
+    const recovery = engine.initialize();
+    transports[1].emit({ type: 'ready', version: '3.13.2' });
+    await recovery;
   }
 });
 
@@ -365,6 +375,228 @@ test('WorkerClient rejects a malformed matching response and ignores an old gene
   const second = engine.run('print(2)');
   transports[1].emit(resultMessage(engine, { stdout: '2\n' }));
   assert.equal((await second).stdout, '2\n');
+});
+
+test('cancel replaces an active run and stale output cannot complete the next run', async t => {
+  const { engine, transports, results } = await initialized(t);
+  const first = engine.run('while True: pass');
+  const oldId = engine.getState().requestId;
+  const cancelled = assert.rejects(first, { code: 'CANCELLED' });
+  const recovery = engine.cancel();
+  assert.equal(engine.cancel(), recovery);
+  await cancelled;
+  assert.equal(transports[0].disposed, 1);
+  assert.equal(engine.getState().status, 'initializing');
+  transports[0].emit({ type: 'result', id: oldId, stdout: 'old' });
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  const second = engine.run('print("new")');
+  const newId = engine.getState().requestId;
+  transports[0].emit({ type: 'stream', id: oldId, stdout: 'old' });
+  transports[0].emit({ type: 'result', id: oldId, stdout: 'old' });
+  transports[1].emit({ type: 'result', id: oldId, stdout: 'old' });
+  assert.equal(engine.getState().requestId, newId);
+  assert.equal(engine.getState().status, 'running');
+  transports[1].emit({ type: 'result', id: newId, stdout: 'new\n' });
+  assert.equal((await second).stdout, 'new\n');
+  assert.deepEqual(results.map(result => result.stdout), ['new\n']);
+});
+
+test('cancel from created or ready is a no-op; cancellation during initialization replaces it', async t => {
+  const { engine, transports } = fixture(t);
+  assert.equal(await engine.cancel(), null);
+  const first = engine.initialize();
+  const interrupted = assert.rejects(first, { code: 'CANCELLED' });
+  const recovery = engine.cancel();
+  await interrupted;
+  transports[0].emit({ type: 'ready', version: '3.13.2' });
+  assert.equal(engine.getState().status, 'initializing');
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  const count = transports.length;
+  assert.equal((await engine.cancel()).status, 'ready');
+  assert.equal(transports.length, count);
+  assert.equal(engine.isReady(), true);
+  assert.equal(engine.isBusy(), false);
+});
+
+test('reset shares replacement, clears packages and ignores old package confirmation', async t => {
+  const { engine, transports } = await initialized(t);
+  const loading = engine.loadPackages(['numpy']);
+  const oldId = engine.getState().requestId;
+  const interrupted = assert.rejects(loading, { code: 'RESET' });
+  const recovery = engine.reset();
+  assert.equal(engine.reset(), recovery);
+  await interrupted;
+  transports[0].emit({ type: 'package-result', id: oldId, results: [{ id: 'numpy', loaded: true }] });
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  assert.deepEqual(engine.getState().loadedPackages, []);
+  assert.equal(engine.getAvailablePackages().find(item => item.id === 'numpy').status, 'unloaded');
+  const next = engine.run('print(1)');
+  transports[1].emit(resultMessage(engine, { stdout: '1\n' }));
+  assert.equal((await next).stdout, '1\n');
+});
+
+test('cancelling package loading clears it and ignores stale package callbacks', async t => {
+  const packageCallbacks = [];
+  const { engine, transports } = await initialized(t, { onPackages: value => packageCallbacks.push(value) });
+  const loading = engine.loadPackages(['numpy']);
+  const oldId = engine.getState().requestId;
+  const interrupted = assert.rejects(loading, { code: 'CANCELLED' });
+  const recovery = engine.cancel();
+  await interrupted;
+  transports[0].emit({ type: 'package-result', id: oldId, results: [{ id: 'numpy', loaded: true }] });
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  await Promise.resolve();
+  assert.deepEqual(packageCallbacks, []);
+  assert.equal(engine.getAvailablePackages().find(item => item.id === 'numpy').status, 'unloaded');
+  assert.equal(engine.ready(), true);
+});
+
+test('timeout and Worker failure recovery reject old work and fail closed if replacement fails', async t => {
+  const { engine, transports } = await initialized(t);
+  const work = engine.run('while True: pass', { timeoutMs: 5 });
+  const oldId = engine.getState().requestId;
+  await assert.rejects(work, { code: 'TIMEOUT' });
+  assert.equal(engine.getState().status, 'initializing');
+  const recovery = engine.initialize();
+  transports[0].emit({ type: 'result', id: oldId, stdout: 'late' });
+  transports[1].emit({ type: 'fatal', message: 'replacement failed' });
+  await assert.rejects(recovery, { code: 'RUNTIME_FAILURE' });
+  assert.equal(engine.getState().status, 'unavailable');
+  assert.equal(engine.isReady(), false);
+  const reset = engine.reset();
+  transports[2].emit({ type: 'ready', version: '3.13.2' });
+  await reset;
+  assert.equal(engine.ready(), true);
+});
+
+test('dispose during recovery is terminal, idempotent and blocks all methods', async t => {
+  const { engine, transports, results } = await initialized(t);
+  const work = engine.run('while True: pass');
+  const interrupted = assert.rejects(work, { code: 'CANCELLED' });
+  const recovery = engine.cancel();
+  await interrupted;
+  engine.dispose();
+  engine.dispose();
+  await assert.rejects(recovery, { code: 'DISPOSED' });
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  assert.equal(engine.getState().status, 'disposed');
+  assert.equal(transports.length, 2);
+  for (const operation of ['run', 'compile', 'inspect', 'diagnose'])
+    await assert.rejects(engine[operation]('pass'), { code: 'DISPOSED' });
+  for (const operation of ['initialize', 'cancel', 'reset'])
+    await assert.rejects(engine[operation](), { code: 'DISPOSED' });
+  await assert.rejects(engine.loadPackages(['numpy']), { code: 'DISPOSED' });
+  assert.deepEqual(results, []);
+});
+
+test('initialization watchdog and Worker creation failure clean up and permit retry', async t => {
+  const events = [], adapters = [];
+  const client = new WorkerClient(event => events.push(event), receive => {
+    const adapter = { receive, disposed: 0, initialize() {}, dispose() { this.disposed++; } };
+    adapters.push(adapter);
+    return adapter;
+  }, 5);
+  t.after(() => client.stop());
+  client.initialize();
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(events[0].type, 'fatal');
+  assert.equal(events[0].code, 'TIMEOUT');
+  assert.equal(adapters[0].disposed, 1);
+  client.initialize();
+  adapters[0].receive({ type: 'ready', version: '9.9.9' });
+  adapters[1].receive({ type: 'ready', version: '3.13.2' });
+  assert.equal(events.at(-1).version, '3.13.2');
+
+  let attempts = 0;
+  const engine = createPythonEngine({ runtimeFactory: receive => {
+    if (++attempts === 1) throw new Error('Worker creation failed');
+    return { initialize() {}, dispose() {}, emit: receive, run() {}, loadPackages() {} };
+  } });
+  t.after(() => engine.dispose());
+  await assert.rejects(engine.initialize(), { code: 'RUNTIME_FAILURE' });
+  assert.equal(engine.getState().status, 'idle');
+  const retry = engine.initialize();
+  engine.client.runtime.emit({ type: 'ready', version: '3.13.2' });
+  await retry;
+});
+
+test('engine initialization timeout is retryable and disposal suppresses queued completion callbacks', async t => {
+  const { engine, transports, results } = fixture(t);
+  engine.client.initializationTimeoutMs = 5;
+  const startup = engine.initialize();
+  await assert.rejects(startup, { code: 'TIMEOUT' });
+  assert.equal(engine.getState().status, 'idle');
+  assert.equal(transports[0].disposed, 1);
+  engine.client.initializationTimeoutMs = 120000;
+  const retry = engine.initialize();
+  transports[0].emit({ type: 'ready', version: '3.13.2' });
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await retry;
+  const work = engine.run('print(1)');
+  transports[1].emit(resultMessage(engine, { stdout: '1\n' }));
+  engine.dispose();
+  await work;
+  await Promise.resolve();
+  assert.deepEqual(results, []);
+  assert.equal(engine.getState().status, 'disposed');
+});
+
+test('repeated timeouts each replace the adapter and reject late responses', async t => {
+  const { engine, transports } = await initialized(t);
+  for (let cycle = 0; cycle < 2; cycle++) {
+    const work = engine.run('while True: pass', { timeoutMs: 5 });
+    const old = transports.at(-1), oldId = engine.getState().requestId;
+    await assert.rejects(work, { code: 'TIMEOUT' });
+    const recovery = engine.initialize();
+    old.emit({ type: 'result', id: oldId, stdout: 'late' });
+    transports.at(-1).emit({ type: 'ready', version: '3.13.2' });
+    await recovery;
+    assert.equal(old.disposed, 1);
+    assert.equal(engine.ready(), true);
+  }
+});
+
+test('a superseded recovery rejection cannot destroy a newer reset', async t => {
+  const { engine, transports } = await initialized(t);
+  const work = engine.run('while True: pass');
+  const cancelled = assert.rejects(work, { code: 'CANCELLED' });
+  const firstRecovery = engine.cancel();
+  await cancelled;
+  const stoppedRecovery = assert.rejects(firstRecovery, { code: 'CANCELLED' });
+  engine.stop();
+  const secondRecovery = engine.reset();
+  await stoppedRecovery;
+  assert.equal(engine.getState().status, 'initializing');
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  assert.equal(engine.getState().status, 'initializing');
+  transports[2].emit({ type: 'ready', version: '3.13.2' });
+  await secondRecovery;
+  assert.equal(engine.ready(), true);
+});
+
+test('repeated cancel, reset and run cycles leave only the current adapter active', async t => {
+  const { engine, transports } = await initialized(t);
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const work = engine.run('while True: pass');
+    const interrupted = assert.rejects(work, { code: 'CANCELLED' });
+    const recovery = engine.cancel();
+    await interrupted;
+    transports.at(-1).emit({ type: 'ready', version: '3.13.2' });
+    await recovery;
+    const next = engine.run('print(1)');
+    transports.at(-1).emit(resultMessage(engine, { stdout: '1\n' }));
+    await next;
+    const reset = engine.reset();
+    transports.at(-1).emit({ type: 'ready', version: '3.13.2' });
+    await reset;
+    assert.equal(engine.client.pending.size, 0);
+    assert.equal(engine.ready(), true);
+  }
+  assert(transports.slice(0, -1).every(adapter => adapter.disposed === 1));
 });
 
 test('CSP, iframe isolation and absent JS bridges remain in production sources', async () => {

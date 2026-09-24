@@ -1,20 +1,26 @@
 import { PyodideRuntime } from '../runtime/runtime.js';
+import { LOAD_TIMEOUT_MS } from '../runtime/config.js';
 
 /** Private request transport. The runtime adapter owns the opaque iframe and port. */
 export class WorkerClient {
-  constructor(onEvent, runtimeFactory = receive => new PyodideRuntime(receive)) {
+  constructor(onEvent, runtimeFactory = receive => new PyodideRuntime(receive), initializationTimeoutMs = LOAD_TIMEOUT_MS) {
     this.onEvent = onEvent;
     this.runtimeFactory = runtimeFactory;
     this.generation = 0;
     this.nextId = 0;
     this.pending = new Map();
     this.initializing = false;
+    this.initializationTimeoutMs = initializationTimeoutMs;
   }
 
   initialize() {
     this.stop();
     const generation = this.generation;
     this.initializing = true;
+    this.initTimer = setTimeout(() => {
+      if (generation === this.generation && this.initializing)
+        this._fail(new Error('Python took too long to initialize.'), 'TIMEOUT');
+    }, this.initializationTimeoutMs);
     try {
       this.runtime = this.runtimeFactory(message => this._receive(message, generation));
       Promise.resolve(this.runtime.initialize()).catch(error => {
@@ -62,11 +68,13 @@ export class WorkerClient {
     if (message.type === 'ready') {
       if (!this.initializing) return;
       this.initializing = false;
+      clearTimeout(this.initTimer);
+      this.initTimer = null;
       this.onEvent({ type: 'ready', version: message.version });
       return;
     }
     if (message.type === 'fatal') {
-      this._fail(new Error(typeof message.message === 'string' ? message.message : 'The Python runtime failed.'));
+      this._fail(new Error(typeof message.message === 'string' ? message.message : 'The Python runtime failed.'), message.code);
       return;
     }
     if (!Number.isSafeInteger(message.id)) return;
@@ -98,14 +106,16 @@ export class WorkerClient {
       (message.truncated === undefined || typeof message.truncated === 'boolean');
   }
 
-  _fail(error) {
+  _fail(error, code) {
     this.stop();
-    this.onEvent({ type: 'fatal', error });
+    this.onEvent({ type: 'fatal', error, code });
   }
 
   stop() {
     this.generation++;
     this.initializing = false;
+    clearTimeout(this.initTimer);
+    this.initTimer = null;
     for (const { timer } of this.pending.values()) clearTimeout(timer);
     this.pending.clear();
     const runtime = this.runtime;

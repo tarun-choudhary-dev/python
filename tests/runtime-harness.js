@@ -31,6 +31,17 @@ export async function runRuntimeTests() {
     const failed = await failure;
     window.fetch = originalFetch;
     assert(failed.message.includes('Simulated runtime download failure'), 'runtime download failure is readable and retryable');
+    const originalCreateElement = document.createElement.bind(document);
+    document.createElement = name => {
+      if (name === 'iframe') throw new Error('Simulated sandbox creation failure');
+      return originalCreateElement(name);
+    };
+    try {
+      const sandboxFailure = wait('fatal'); runtime.initialize();
+      const failedSandbox = await sandboxFailure;
+      assert(failedSandbox.message.includes('Simulated sandbox creation failure'),
+        'iframe creation failure tears down the adapter and remains retryable');
+    } finally { document.createElement = originalCreateElement; }
     const ready = wait('ready'); runtime.initialize();
     const info = await ready;
     assert(/^3\./.test(info.version), `CPython ${info.version} loaded in sandboxed browser worker`);

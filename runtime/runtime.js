@@ -8,7 +8,7 @@ export class PyodideRuntime {
   async initialize() {
     this.dispose();
     const generation = this.generation;
-    this.timer = setTimeout(() => this.fail('Python took too long to load. Check your connection and retry.'), LOAD_TIMEOUT_MS);
+    this.timer = setTimeout(() => this.fail('Python took too long to load. Check your connection and retry.', 'TIMEOUT'), LOAD_TIMEOUT_MS);
     try {
       const assets = await loadRuntimeAssets();
       if (generation !== this.generation) return;
@@ -18,7 +18,7 @@ export class PyodideRuntime {
       this.frame.setAttribute('sandbox', 'allow-scripts');
       this.frame.setAttribute('allow', "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-read 'none'; clipboard-write 'none'; usb 'none'; serial 'none'; hid 'none'; payment 'none'");
       this.frame.src = new URL('./sandbox.html', import.meta.url).href;
-      this.frame.addEventListener('load', () => {
+      this.onFrameLoad = () => {
         if (generation !== this.generation) return;
         const channel = new MessageChannel();
         this.port = channel.port1;
@@ -26,14 +26,19 @@ export class PyodideRuntime {
           if (generation !== this.generation || !data || typeof data !== 'object') return;
           if (data.type === 'connected') this.port.postMessage({ type: 'init', assets, maxOutput: MAX_OUTPUT_CHARS, packageCatalog: PYTHON_PACKAGES });
           else if (data.type === 'ready') { clearTimeout(this.timer); this.onMessage(data); }
-          else if (data.type === 'fatal') this.fail(typeof data.message === 'string' ? data.message : 'Python could not start. Retry to reload it.');
+          else if (data.type === 'fatal') this.fail(typeof data.message === 'string' ? data.message : 'Python could not start. Retry to reload it.', data.code);
           else if (data.type === 'result' || data.type === 'stream' || data.type === 'package-result') this.onMessage(data);
         };
         this.port.onmessageerror = () => {
           if (generation === this.generation) this.fail('The Python sandbox sent an unreadable response.');
         };
         this.frame.contentWindow.postMessage('pylab-connect', '*', [channel.port2]);
-      }, { once: true });
+      };
+      this.onFrameError = () => {
+        if (generation === this.generation) this.fail('The Python sandbox could not load.');
+      };
+      this.frame.addEventListener('load', this.onFrameLoad, { once: true });
+      this.frame.addEventListener('error', this.onFrameError);
       document.body.append(this.frame);
     } catch (error) {
       if (generation === this.generation) this.fail(error instanceof Error ? error.message : 'Python could not load. Check your connection and retry.');
@@ -65,14 +70,25 @@ export class PyodideRuntime {
       this.onMessage({ type: 'package-result', id, results: packageIds.map(packageId => ({ id: packageId, error: message })), loadedRuntimeNames: [] });
     }
   }
-  fail(message) { this.dispose(); this.onMessage({ type: 'fatal', message }); }
+  fail(message, code) { this.dispose(); this.onMessage({ type: 'fatal', message, code }); }
   dispose() {
     this.generation++;
     clearTimeout(this.timer);
-    this.port?.postMessage({ type: 'stop' });
-    this.port?.close();
-    this.frame?.remove();
+    const port = this.port, frame = this.frame;
     this.port = null;
     this.frame = null;
+    if (frame) {
+      if (this.onFrameLoad) frame.removeEventListener('load', this.onFrameLoad);
+      if (this.onFrameError) frame.removeEventListener('error', this.onFrameError);
+    }
+    this.onFrameLoad = null;
+    this.onFrameError = null;
+    if (port) {
+      port.onmessage = null;
+      port.onmessageerror = null;
+      try { port.postMessage({ type: 'stop' }); } catch { /* Closing the port still invalidates it. */ }
+      try { port.close(); } catch { /* The iframe is removed below. */ }
+    }
+    frame?.remove();
   }
 }

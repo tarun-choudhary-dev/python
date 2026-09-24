@@ -28,6 +28,8 @@ export class PythonEngine {
 
   get capabilities() { return ENGINE_CAPABILITIES; }
   ready() { return this.status === 'ready'; }
+  isReady() { return this.ready(); }
+  isBusy() { return Boolean(this.active); }
   getState() {
     return {
       status: this.status, ready: this.ready(), pythonVersion: this.pythonVersion,
@@ -44,6 +46,7 @@ export class PythonEngine {
 
   initialize() {
     if (this.status === 'disposed') return Promise.reject(this._error('DISPOSED'));
+    if (this.recovery) return this.recovery;
     if (this.ready()) return Promise.resolve(this.getRuntimeInfo());
     if (this.initializer) return this.initializer.promise;
     if (this.active) return Promise.reject(this._error('BUSY'));
@@ -104,10 +107,38 @@ export class PythonEngine {
     return wasActive;
   }
 
+  cancel() {
+    if (this.status === 'disposed') return Promise.reject(this._error('DISPOSED'));
+    if (this.recovery) return this.recovery;
+    if (this.status === 'unavailable') return Promise.reject(this._error('INVALID_STATE'));
+    if (!this.active && !this.initializer)
+      return Promise.resolve(this.ready() ? this.getRuntimeInfo() : null);
+    this._destroy(this._error('CANCELLED'), 'stopped');
+    return this._recover();
+  }
+
   reset() {
     if (this.status === 'disposed') return Promise.reject(this._error('DISPOSED'));
+    if (this.recovery) return this.recovery;
     this._destroy(this._error('RESET'), 'stopped');
-    return this.initialize();
+    return this._recover();
+  }
+
+  _recover() {
+    if (this.recovery) return this.recovery;
+    const attempt = this.initialize();
+    const recovery = attempt.then(
+      info => { if (this.recovery === recovery) this.recovery = null; return info; },
+      error => {
+        if (this.recovery === recovery) {
+          this.recovery = null;
+          if (this.status !== 'disposed' && this.status !== 'unavailable')
+            this._destroy(error, 'unavailable');
+        }
+        throw error;
+      });
+    this.recovery = recovery;
+    return recovery;
   }
 
   dispose() {
@@ -136,13 +167,15 @@ export class PythonEngine {
       return;
     }
     if (message.type === 'fatal') {
-      this._fatal(message.error);
+      this._fatal(message.error, message.code);
       return;
     }
     if (message.type === 'timeout') {
-      const error = new PythonEngineError('The Python operation exceeded its time limit. Reset or initialize the engine to continue.', 'TIMEOUT');
+      if (!this.active || message.id !== this.active.id) return;
+      const error = new PythonEngineError('The Python operation exceeded its time limit. The engine is restarting.', 'TIMEOUT');
       this._destroy(error, 'stopped');
       this._emit('onError', error);
+      this._recover().catch(() => {});
       return;
     }
     const active = this.active;
@@ -199,14 +232,18 @@ export class PythonEngine {
     active.resolve(result);
   }
 
-  _fatal(cause) {
-    const error = new PythonEngineError(cause instanceof Error ? cause.message.slice(0, 1000) : 'The Python runtime failed.', 'RUNTIME_FAILURE');
-    this._destroy(error, 'unavailable');
+  _fatal(cause, code = 'RUNTIME_FAILURE') {
+    const initializing = Boolean(this.initializer);
+    const recovering = Boolean(this.recovery);
+    const error = new PythonEngineError(cause instanceof Error ? cause.message.slice(0, 1000) : 'The Python runtime failed.', code === 'TIMEOUT' ? 'TIMEOUT' : 'RUNTIME_FAILURE');
+    this._destroy(error, recovering ? 'unavailable' : initializing ? 'idle' : 'stopped');
     this._emit('onError', error);
+    if (!recovering && !initializing && this.status !== 'disposed') this._recover().catch(() => {});
   }
 
   _destroy(error, status) {
     this.generation++;
+    this.recovery = null;
     const active = this.active, initializer = this.initializer;
     this.active = null;
     this.initializer = null;
@@ -223,7 +260,7 @@ export class PythonEngine {
   _setStatus(status) {
     if (this.status === status) return;
     this.status = status;
-    this._emit('onStatus', this.getState());
+    this._emit('onStatus', this.getState(), true);
   }
   _emit(name, value, currentGenerationOnly = false) {
     const callback = this.callbacks[name], generation = this.generation;
@@ -238,6 +275,7 @@ export class PythonEngine {
     const messages = {
       DISPOSED: 'The Python engine has been disposed.', CANCELLED: 'The Python operation was stopped.',
       RESET: 'The Python runtime was reset.', BUSY: 'The Python engine is busy.',
+      INVALID_STATE: 'Reset the Python engine before cancelling from this state.',
       NOT_READY: 'Initialize the Python engine before starting an operation.',
     };
     return new PythonEngineError(messages[code], code);
