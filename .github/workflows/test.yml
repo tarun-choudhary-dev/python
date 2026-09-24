@@ -17,5 +17,6 @@ jobs:
         with:
           node-version: 24
       - run: npm test
+      - run: npm run test:runtime
       - run: npm run build
       - run: npm run test:runtime -- --built

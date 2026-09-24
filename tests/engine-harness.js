@@ -83,6 +83,14 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
 
     let result = await run('print("hello")');
     assert(result.stdout === 'hello\n' && result.status === 'completed' && result.exitCode === 0, 'run returns captured output and completion status');
+    assert(JSON.stringify(Object.keys(result).sort()) === JSON.stringify([
+      'protocolVersion', 'requestId', 'generation', 'operation', 'status', 'exitCode', 'filename',
+      'stdout', 'stderr', 'error', 'errorLine', 'durationMs', 'outputTruncated', 'pythonVersion', 'runtime', 'diagnostics',
+    ].sort()), 'run result retains the exact version-1 public field set');
+    assert(result.requestId > 0 && result.generation === engine.getState().generation &&
+      result.runtime.name === 'Pyodide' && result.runtime.version === '0.29.3' &&
+      result.runtime.pythonVersion === result.pythonVersion,
+      'run result retains public identity and runtime metadata');
     assert(!Object.hasOwn(result, 'inspection'), 'run result contains no compiler inspection artifacts');
     assert(JSON.stringify(JSON.parse(JSON.stringify(result))) === JSON.stringify(result), 'result is JSON serializable');
     result = await run('print("α🙂", end="")');
@@ -104,6 +112,17 @@ export async function runEngineTests(entry = new URL('../index.js', import.meta.
       assert(result.status === 'completed' && !result.stdout && !result.stderr && !result.error &&
         result.operation === operation && result.inspection.codeObjectText.includes('co_filename: analysis.py'),
         operation + ' uses CPython but does not execute user source');
+      assert(Object.keys(result).length === 17 && Object.hasOwn(result, 'inspection') &&
+        Array.isArray(result.inspection.tokens) && Array.isArray(result.inspection.ast.nodes) &&
+        Array.isArray(result.inspection.instructions), operation + ' retains the public analysis shape');
+      await rejects(engine[operation]('  \n'), 'EMPTY_SOURCE');
+      result = await engine[operation]('print(');
+      assert(result.status === 'failed' && result.diagnostics.some(item => item.kind === 'syntax') &&
+        result.inspection.ast.error, operation + ' returns syntax failure with partial analysis');
+      result = await engine[operation]('value = 1\n'.repeat(600));
+      assert(result.inspection.tokens.length <= 1500 && result.inspection.ast.nodes.length <= 500 &&
+        result.inspection.codeObjects.length <= 40 && result.inspection.instructions.length <= 4000 &&
+        result.inspection.tokensTruncated, operation + ' bounds explicit analysis artifacts');
     }
     result = await engine.compile('import definitely_missing_package');
     assert(result.status === 'completed', 'compile does not execute imports');

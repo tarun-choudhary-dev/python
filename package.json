@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "description": "A reusable browser CPython engine with isolated execution and compiler inspection.",
+  "license": "AGPL-3.0-only",
+  "repository": { "type": "git", "url": "https://github.com/tarun-choudhary-dev/python.git" },
   "exports": "./index.js",
   "files": ["index.js", "python-engine/", "runtime/", "README.md", "THIRD_PARTY.md", "LICENSE"],
   "scripts": {

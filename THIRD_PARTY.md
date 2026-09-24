@@ -1,12 +1,11 @@
-# Third-party components
+# Third-party components and runtime notices
 
-## Pyodide 0.29.3
+The npm tarball and `dist/` contain the project's JavaScript/Python source and browser sandbox, with no vendored Pyodide binaries, CPython standard library archive, package wheels, npm dependencies or source maps. The project's own code is covered by the accompanying `LICENSE` (AGPL-3.0-only); that license does not replace third-party licenses.
 
-Downloaded at runtime from `https://cdn.jsdelivr.net/pyodide/v0.29.3/full/`. Pyodide is distributed under MPL-2.0; its CPython runtime and bundled components retain their respective licenses. Runtime binaries are not vendored in this repository.
+| Component | Version/source used by this engine | License and notice source | Shipped in this package? |
+| --- | --- | --- | --- |
+| Pyodide JavaScript/Wasm loader and runtime | 0.29.3, fetched from `https://cdn.jsdelivr.net/pyodide/v0.29.3/full/` | [Pyodide 0.29.3 LICENSE (MPL-2.0)](https://github.com/pyodide/pyodide/blob/0.29.3/LICENSE) and [source release](https://github.com/pyodide/pyodide/tree/0.29.3) | No; fetched by the host page when initialized. |
+| CPython and Python standard library within Pyodide | CPython 3.13.2 observed with pinned Pyodide 0.29.3 | [Python 3.13 history, PSF License v2 and incorporated-software notices](https://docs.python.org/3.13/license.html) | No; contained in the downloaded Pyodide runtime. |
+| Curated Python packages and transitive dependencies | Nine public package IDs and 17 additional lockfile dependencies (26 unique archives in their combined closure), with versions and archive hashes listed in the [Pyodide 0.29.3 lockfile](https://cdn.jsdelivr.net/pyodide/v0.29.3/full/pyodide-lock.json) | Each archive may have separate license/notice material; none of these 26 lockfile entries has a license field. Check the actual archive metadata and license files before redistributing them. | No; selected archives are fetched from the same pinned CDN only when requested. |
 
-- Source and licenses: https://github.com/pyodide/pyodide/tree/0.29.3
-- JavaScript API: https://pyodide.org/en/0.29.3/usage/api/js-api.html
-- Worker documentation: https://pyodide.org/en/0.29.3/usage/webworker.html
-- CPython license: https://docs.python.org/3/license.html
-
-The repository's existing `LICENSE` is preserved and applies to the project's original code, not to these separately licensed dependencies.
+The host downloads the pinned five Pyodide runtime files (`pyodide.js`, `pyodide.asm.js`, `pyodide.asm.wasm`, `python_stdlib.zip`, `pyodide-lock.json`) and selected wheel archives. The runtime's Pyodide, CPython and incorporated-software notices remain distinct. This package does not grant rights to relicense or strip notices from those downloaded components. A deployment that self-hosts or redistributes the runtime or wheels must include and review the corresponding upstream license and notice material for the exact artifacts it serves; the links above are attribution and verification pointers, not copies of every wheel's license text.

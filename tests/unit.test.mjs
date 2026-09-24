@@ -229,6 +229,80 @@ test('streaming ignores regressions and flushes final chunks exactly once', asyn
   assert.equal(validateOutput({ stdout: 'x'.repeat(100001) }).outputTruncated, true);
 });
 
+test('a final result cannot contradict output already streamed to consumers', async t => {
+  const stdout = [], completed = [];
+  const { engine, transports } = await initialized(t, {
+    onStdout: chunk => stdout.push(chunk), onResult: result => completed.push(result),
+  });
+  const running = engine.run('print("hello")');
+  transports[0].emit({ type: 'stream', id: engine.getState().requestId, stdout: 'hello', stderr: '' });
+  await Promise.resolve();
+  transports[0].emit(resultMessage(engine, { stdout: 'hell' }));
+  await assert.rejects(running, { code: 'RUNTIME_FAILURE' });
+  assert.deepEqual(stdout, ['hello']);
+  assert.deepEqual(completed, []);
+  assert.equal(engine.getState().status, 'initializing');
+  const recovery = engine.initialize();
+  transports[1].emit({ type: 'ready', version: '3.13.2' });
+  await recovery;
+  assert.equal(engine.ready(), true);
+});
+
+test('public analysis operations enforce request, lifecycle, timeout and disposal rules', async t => {
+  for (const operation of ['compile', 'inspect', 'diagnose']) {
+    const { engine, transports } = fixture(t);
+    await assert.rejects(engine[operation]('pass'), { code: 'NOT_READY' });
+    const startup = engine.initialize();
+    transports[0].emit({ type: 'ready', version: '3.13.2' });
+    await startup;
+    await assert.rejects(engine[operation]('  \n'), { code: 'EMPTY_SOURCE' });
+    await assert.rejects(engine[operation]({ source: 'pass', timeoutMs: 0 }), { code: 'INVALID_TIMEOUT' });
+    const pending = engine[operation]('pass');
+    assert.equal(engine.getState().activeOperation, operation);
+    await assert.rejects(engine.run('pass'), { code: 'BUSY' });
+    await assert.rejects(engine[operation]('pass'), { code: 'BUSY' });
+    const cancelled = assert.rejects(pending, { code: 'CANCELLED' });
+    const recovery = engine.cancel();
+    await cancelled;
+    transports.at(-1).emit({ type: 'ready', version: '3.13.2' });
+    await recovery;
+    const timed = engine[operation]('pass', { timeoutMs: 5 });
+    await assert.rejects(timed, { code: 'TIMEOUT' });
+    const timeoutRecovery = engine.initialize();
+    transports.at(-1).emit({ type: 'ready', version: '3.13.2' });
+    await timeoutRecovery;
+    const resetPending = engine[operation]('pass');
+    const resetError = assert.rejects(resetPending, { code: 'RESET' });
+    const reset = engine.reset();
+    await resetError;
+    transports.at(-1).emit({ type: 'ready', version: '3.13.2' });
+    await reset;
+    const disposed = engine[operation]('pass');
+    const disposedError = assert.rejects(disposed, { code: 'DISPOSED' });
+    engine.dispose();
+    await disposedError;
+    await assert.rejects(engine[operation]('pass'), { code: 'DISPOSED' });
+  }
+});
+
+test('malformed analysis replies fail each public analysis operation and permit recovery', async t => {
+  for (const [operation, malformed] of [
+    ['compile', { tokens: {} }],
+    ['inspect', { trace: { astNodes: [] }, astTree: 7 }],
+    ['diagnose', { trace: { instructions: Array(LIMITS.instructionCount + 1).fill({}) } }],
+  ]) {
+    const { engine, transports } = await initialized(t);
+    const pending = engine[operation]('pass');
+    transports[0].emit(resultMessage(engine, malformed));
+    await assert.rejects(pending, { code: 'RUNTIME_FAILURE' });
+    assert.equal(engine.getState().status, 'initializing');
+    const recovery = engine.initialize();
+    transports[1].emit({ type: 'ready', version: '3.13.2' });
+    await recovery;
+    assert.equal(engine.ready(), true);
+  }
+});
+
 test('late results and streams cannot complete a newer request', async t => {
   const { engine, transports, results } = await initialized(t);
   const first = engine.run('pass'), oldId = engine.getState().requestId;

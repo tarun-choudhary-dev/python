@@ -204,6 +204,11 @@ export class PythonEngine {
         packages, loadedPackages: this._loadedPackages() };
       this._finish(active, result, 'onPackages');
     } else if (message.type === 'result' && active.operation !== 'load-packages') {
+      if (active.operation === 'run' &&
+          (!payload.stdout.startsWith(active.stdout) || !payload.stderr.startsWith(active.stderr))) {
+        this._fatal(new Error('The Python transport returned output behind the streamed prefix.'));
+        return;
+      }
       const result = createEngineResult(payload, {
         operation: active.operation, filename: active.request.filename, pythonVersion: this.pythonVersion,
         requestId: active.id, generation: this.generation,
