@@ -1,0 +1,16 @@
+{
+  "name": "pylab-python-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A reusable browser CPython engine with isolated execution and compiler inspection.",
+  "exports": "./index.js",
+  "files": ["index.js", "python-engine/", "runtime/", "README.md", "THIRD_PARTY.md", "LICENSE"],
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/unit.test.mjs",
+    "test:runtime": "node tests/browser-runtime.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

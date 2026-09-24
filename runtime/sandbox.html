@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<!-- This policy is inherited by the blob worker. No network, storage origin, forms or navigation privileges. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' blob:; worker-src blob:; connect-src 'none'; img-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Isolated Python runtime</title></head><body>
+<script>
+(() => {
+  let connected = false;
+  addEventListener('message', event => {
+    if (connected || event.source !== parent || event.data !== 'pylab-connect' || event.ports.length !== 1) return;
+    connected = true;
+    const port = event.ports[0];
+    let worker;
+    port.onmessage = ({ data }) => {
+      if (data.type === 'init' && !worker) {
+        const url = URL.createObjectURL(new Blob([data.assets.workerSource], { type: 'text/javascript' }));
+        worker = new Worker(url, { name: 'pylab-python' });
+        URL.revokeObjectURL(url);
+        worker.onmessage = event => port.postMessage(event.data);
+        worker.onerror = () => port.postMessage({ type: 'fatal', message: 'The Python worker stopped unexpectedly. Retry to start a fresh runtime.' });
+        worker.postMessage({ type: 'init', assets: data.assets, maxOutput: data.maxOutput, packageCatalog: data.packageCatalog });
+      } else if (data.type === 'run' && worker) {
+        worker.postMessage({ type: 'run', id: data.id, source: data.source, operation: data.operation, filename: data.filename });
+      } else if (data.type === 'load-packages' && worker) {
+        worker.postMessage({ type: 'load-packages', id: data.id, packages: data.packages, errors: data.errors, files: data.files });
+      } else if (data.type === 'stop') {
+        worker?.terminate();
+        worker = null;
+        port.close();
+      }
+    };
+    port.postMessage({ type: 'connected' });
+  });
+})();
+</script></body></html>
